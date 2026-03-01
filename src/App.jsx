@@ -14,6 +14,7 @@ const DETAIL_PANEL_MAX_HEIGHT = 600;
 const TAG_COL_WIDTH_DEFAULT = 100;
 const TAG_COL_WIDTH_MIN = 60;
 const BKMK_COL_WIDTH = 34;
+const CHECKBOX_COL_WIDTH = 24;
 
 const THEMES = {
   dark: {
@@ -28,6 +29,7 @@ const THEMES = {
     panelBg: "#0b0d10", cellBorder: "#12151a", accentSubtle: "rgba(232,93,42,0.12)",
     histBar: "#E85D2A", histBarHover: "#F47B50", histGrid: "#1e2028",
     primaryBtn: "#E85D2A", primaryBtnHover: "#C44D1E",
+    toolbarBg: "rgba(24,27,32,0.82)", glassBg: "rgba(255,255,255,0.05)", glassBorder: "rgba(255,255,255,0.08)", glassHover: "rgba(255,255,255,0.10)",
   },
   light: {
     bg: "#ffffff", bgAlt: "#f7f5f3", bgInput: "#ffffff", border: "#e0dbd6", borderAccent: "#E85D2A",
@@ -41,6 +43,7 @@ const THEMES = {
     panelBg: "#f0ebe6", cellBorder: "#ebe6e0", accentSubtle: "rgba(232,93,42,0.08)",
     histBar: "#E85D2A", histBarHover: "#C44D1E", histGrid: "#e0dbd6",
     primaryBtn: "#E85D2A", primaryBtnHover: "#C44D1E",
+    toolbarBg: "rgba(247,245,243,0.82)", glassBg: "rgba(0,0,0,0.03)", glassBorder: "rgba(0,0,0,0.06)", glassHover: "rgba(0,0,0,0.08)",
   },
 };
 
@@ -129,6 +132,20 @@ function applyColors(row, compiledRules) {
 const BkmkIcon = ({ filled }) => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill={filled ? "#d29922" : "none"} stroke={filled ? "#d29922" : "#484f58"} strokeWidth="2">
     <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+  </svg>
+);
+
+const CheckboxIcon = ({ checked, indeterminate }) => (
+  <svg width="13" height="13" viewBox="0 0 16 16" style={{ verticalAlign: "middle" }}>
+    <rect x="1" y="1" width="14" height="14" rx="2"
+      fill={checked || indeterminate ? "#E85D2A" : "none"}
+      stroke={checked || indeterminate ? "#E85D2A" : "#484f58"} strokeWidth="1.5" />
+    {checked && !indeterminate && (
+      <polyline points="4,8 7,11 12,5" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    )}
+    {indeterminate && (
+      <line x1="4" y1="8" x2="12" y2="8" stroke="#fff" strokeWidth="2" strokeLinecap="round" />
+    )}
   </svg>
 );
 
@@ -549,6 +566,11 @@ export default function App() {
   const [dateRangeDropdown, setDateRangeDropdown] = useState(null); // { colName, x, y, from, to }
   const [filterPresets, setFilterPresets] = useState([]);
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [fileMenuOpen, setFileMenuOpen] = useState(false);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const [actionsMenuOpen, setActionsMenuOpen] = useState(false);
+  const [helpMenuOpen, setHelpMenuOpen] = useState(false);
+  const [recentFiles, setRecentFiles] = useState([]);
 
   // Filter dropdown internal state
   const [fdValues, setFdValues] = useState([]);
@@ -1023,10 +1045,15 @@ export default function App() {
       "native-context-menu",
       "set-datetime-format", "set-timezone", "set-font-size",
       "trigger-reset-columns", "set-theme", "trigger-histogram",
+      "recent-files-updated",
     ];
 
     // Remove any pre-existing listeners to avoid duplicates
     allChannels.forEach((ch) => tle.removeAllListeners(ch));
+
+    // Load recent files on startup
+    tle.getRecentFiles().then((files) => setRecentFiles(files || [])).catch(() => {});
+    tle.onRecentFilesUpdated((files) => setRecentFiles(files || []));
 
     tle.onImportStart(({ tabId, fileName, filePath, fileSize }) => {
       setImportingTabs((prev) => ({ ...prev, [tabId]: { fileName, rowsImported: 0, percent: 0, status: "importing", fileSize: fileSize || 0 } }));
@@ -1390,13 +1417,13 @@ export default function App() {
 
   const pinnedOffsets = useMemo(() => {
     const offsets = {};
-    let x = BKMK_COL_WIDTH + tagColWidth; // after # column + Tags column
+    let x = (isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH)) + tagColWidth; // after # + checkbox + Tags
     for (const h of pinnedH) {
       offsets[h] = x;
       x += (ct?.columnWidths[h] || 150);
     }
     return { offsets, totalWidth: x };
-  }, [pinnedH, ct?.columnWidths, tagColWidth]);
+  }, [pinnedH, ct?.columnWidths, tagColWidth, isGrouped]);
 
   // ── Grouped items (multi-level) ─────────────────────────────────
   const groupedItems = useMemo(() => {
@@ -1483,6 +1510,53 @@ export default function App() {
     setDetailPanelOpen(true);
   };
 
+  const handleCheckboxToggle = (ai) => {
+    setSelectedRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(ai)) next.delete(ai);
+      else next.add(ai);
+      return next;
+    });
+    setLastClickedRow(ai);
+  };
+
+  const handleGroupSelectAll = (groupHeaderAi) => {
+    if (!displayRows) return;
+    const groupItem = displayRows[groupHeaderAi];
+    if (!groupItem || groupItem.type !== "group") return;
+    const baseDepth = groupItem.depth;
+    const rowIndices = [];
+    for (let j = groupHeaderAi + 1; j < displayRows.length; j++) {
+      const child = displayRows[j];
+      if (child.type === "group" && child.depth <= baseDepth) break;
+      if (child.type === "row") rowIndices.push(j);
+    }
+    if (rowIndices.length === 0) return;
+    const allSelected = rowIndices.every((idx) => selectedRows.has(idx));
+    setSelectedRows((prev) => {
+      const next = new Set(prev);
+      for (const idx of rowIndices) {
+        if (allSelected) next.delete(idx);
+        else next.add(idx);
+      }
+      return next;
+    });
+  };
+
+  const getGroupCheckState = (groupAi, depth) => {
+    if (!displayRows) return { total: 0, selected: 0 };
+    let total = 0, selected = 0;
+    for (let j = groupAi + 1; j < displayRows.length; j++) {
+      const c = displayRows[j];
+      if (c.type === "group" && c.depth <= depth) break;
+      if (c.type === "row") {
+        total++;
+        if (selectedRows.has(j)) selected++;
+      }
+    }
+    return { total, selected };
+  };
+
   const detailVisible = detailPanelOpen && selectedRowData !== null;
   const totalCount = isGrouped ? displayRows.length : (ct?.totalFiltered || 0);
   const rowOffset = ct?.rowOffset || 0;
@@ -1542,6 +1616,8 @@ export default function App() {
     if (!hlRegex || !iocRegex) return null;
     try { return new RegExp(`${iocRegex.source}|${hlRegex.source}`, "gi"); } catch { return null; }
   }, [hlRegex, iocRegex]);
+  const _hlStyle = { background: "rgba(210,153,34,0.5)", color: "inherit", borderRadius: 2, padding: "0 1px" };
+  const _iocStyle = { background: "rgba(240,136,62,0.45)", color: "inherit", borderRadius: 2, padding: "0 1px", fontWeight: 600 };
   const renderCell = (h, val) => {
     const text = fmtCell(h, val);
     if (!text || (!hlRegex && !iocRegex)) return text;
@@ -1550,7 +1626,7 @@ export default function App() {
       const splits = text.split(hlRegex);
       if (splits.length <= 1) return text;
       return <>{splits.map((seg, i) => i % 2 === 1
-        ? <mark key={i} style={{ background: "rgba(210,153,34,0.5)", color: "inherit", borderRadius: 2, padding: "0 1px" }}>{seg}</mark>
+        ? <mark key={i} style={_hlStyle}>{seg}</mark>
         : seg
       )}</>;
     }
@@ -1558,33 +1634,30 @@ export default function App() {
       const splits = text.split(iocRegex);
       if (splits.length <= 1) return text;
       return <>{splits.map((seg, i) => i % 2 === 1
-        ? <mark key={i} style={{ background: "rgba(240,136,62,0.45)", color: "inherit", borderRadius: 2, padding: "0 1px", fontWeight: 600 }}>{seg}</mark>
+        ? <mark key={i} style={_iocStyle}>{seg}</mark>
         : seg
       )}</>;
     }
     // Both active — use pre-built combined regex, color by match type
     if (!combinedHlRegex) return text;
-    const combined = new RegExp(combinedHlRegex.source, "gi"); // clone to reset lastIndex
+    combinedHlRegex.lastIndex = 0; // reset instead of cloning
     const parts = [];
     let lastIndex = 0;
     let m;
-    while ((m = combined.exec(text)) !== null) {
+    while ((m = combinedHlRegex.exec(text)) !== null) {
       if (m.index > lastIndex) parts.push(text.slice(lastIndex, m.index));
       const isIoc = iocTestRegex.test(m[0]);
-      parts.push(<mark key={m.index} style={{
-        background: isIoc ? "rgba(240,136,62,0.45)" : "rgba(210,153,34,0.5)",
-        color: "inherit", borderRadius: 2, padding: "0 1px", ...(isIoc ? { fontWeight: 600 } : {}),
-      }}>{m[0]}</mark>);
-      lastIndex = combined.lastIndex;
-      if (m[0].length === 0) { combined.lastIndex++; }
+      parts.push(<mark key={m.index} style={isIoc ? _iocStyle : _hlStyle}>{m[0]}</mark>);
+      lastIndex = combinedHlRegex.lastIndex;
+      if (m[0].length === 0) { combinedHlRegex.lastIndex++; }
     }
     if (lastIndex === 0) return text;
     if (lastIndex < text.length) parts.push(text.slice(lastIndex));
     return <>{parts}</>;
   };
   const tw = useMemo(
-    () => allVisH.reduce((s, h) => s + (ct?.columnWidths?.[h] || 150), 0) + BKMK_COL_WIDTH + tagColWidth,
-    [allVisH, ct?.columnWidths, tagColWidth]
+    () => allVisH.reduce((s, h) => s + (ct?.columnWidths?.[h] || 150), 0) + (isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH)) + tagColWidth,
+    [allVisH, ct?.columnWidths, tagColWidth, isGrouped]
   );
 
   // Reset search match index when search term or results change
@@ -1829,13 +1902,14 @@ export default function App() {
       if (mod && e.key === "e") { e.preventDefault(); handleExport(); }
       if (mod && e.key === "b") { e.preventDefault(); if (ct) up("showBookmarkedOnly", !ct.showBookmarkedOnly); }
       if (mod && e.key === "r") { e.preventDefault(); resetColumnWidths(); }
-      if (mod && e.key === "c" && selectedRows.size > 0 && ct && !isGrouped) {
+      if (mod && e.key === "c" && selectedRows.size > 0 && ct) {
         e.preventDefault();
         const hdrs = ct.headers.filter((h) => !ct.hiddenColumns?.has(h));
         const sortedIndices = [...selectedRows].sort((a, b) => a - b);
         const lines = [hdrs.join("\t")];
         for (const idx of sortedIndices) {
-          const r = getRowAt(idx);
+          const item = getRowAt(idx);
+          const r = isGrouped ? (item?.type === "row" ? item.data : null) : item;
           if (r) lines.push(hdrs.map((h) => (r[h] || "").replace(/\t/g, " ")).join("\t"));
         }
         navigator.clipboard?.writeText(lines.join("\n"));
@@ -2077,7 +2151,7 @@ export default function App() {
 
   // ── Themed style constants ───────────────────────────────────────
   const Sdiv = () => <span style={{ width: 1, height: 12, background: th.border, display: "inline-block" }} />;
-  const tb = { display: "flex", alignItems: "center", gap: 5, padding: "5px 10px", background: "transparent", color: th.textDim, border: "none", borderRadius: 5, fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "-apple-system,sans-serif", whiteSpace: "nowrap" };
+  const tb = { display: "flex", alignItems: "center", gap: 5, padding: "5px 12px", background: "transparent", color: th.textDim, border: "none", borderRadius: 7, fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "-apple-system,sans-serif", whiteSpace: "nowrap" };
   const tdv = { width: 1, height: 20, background: th.border, margin: "0 4px", display: "inline-block" };
   const ms = {
     mh: { margin: "0 0 14px", fontSize: 16, fontWeight: 600, color: th.text, fontFamily: "-apple-system, sans-serif" },
@@ -2157,6 +2231,10 @@ export default function App() {
         ::-webkit-scrollbar-thumb { background: ${th.textMuted}; border-radius: 7px; border: 3px solid ${th.bg}; }
         ::-webkit-scrollbar-thumb:hover { background: ${th.textDim}; }
         ::-webkit-scrollbar-corner { background: ${th.bg}; }
+        .tle-tb { transition: background 0.15s, color 0.15s; }
+        .tle-tb:hover { background: ${th.glassHover} !important; }
+        .tle-tab { transition: background 0.15s, box-shadow 0.15s; }
+        .tle-tab:hover { background: ${th.glassHover} !important; }
       `}</style>
 
       {/* Drop overlay — shown when dragging files over the app */}
@@ -2171,29 +2249,92 @@ export default function App() {
       )}
 
       {/* Toolbar — draggable title bar region */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "4px 10px 4px 84px", background: th.bgAlt, borderBottom: `1px solid ${th.border}`, gap: 8, flexShrink: 0, WebkitAppRegion: "drag" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 2, WebkitAppRegion: "no-drag" }}>
-          <button onClick={() => tle?.openFileDialog()} style={tb}>Open</button>
-          <button onClick={handleExport} style={tb}>Export</button>
-          <div style={tdv} />
-          <button onClick={() => ct && up("showBookmarkedOnly", !ct.showBookmarkedOnly)} style={{ ...tb, color: ct?.showBookmarkedOnly ? th.warning : th.textDim }}>{ct?.showBookmarkedOnly ? "★" : "☆"} Flagged</button>
-          <button onClick={() => { if (ct?.dataReady) setModal({ type: "bulkActions", tagName: "", tagColor: "#E85D2A", result: null }); }} style={{ ...tb, opacity: ct?.dataReady ? 1 : 0.4 }} disabled={!ct?.dataReady}>Bulk Actions</button>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px 6px 84px", background: th.bgAlt, borderBottom: `1px solid ${th.glassBorder}`, gap: 10, flexShrink: 0, position: "relative", zIndex: 100, WebkitAppRegion: "drag" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, WebkitAppRegion: "no-drag" }}>
+          {/* Menu capsule */}
+          <div style={{ display: "flex", alignItems: "center", gap: 1, background: th.glassBg, border: `1px solid ${th.glassBorder}`, borderRadius: 9, padding: 2 }}>
           <div style={{ position: "relative" }}>
-            <button onClick={() => setToolsOpen((v) => !v)} style={{ ...tb, color: toolsOpen ? th.accent : th.textDim }}>Tools ▾</button>
-            {toolsOpen && (<>
-              <div onClick={() => setToolsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 149 }} />
-              <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: th.modalBg, border: `1px solid ${th.modalBorder}`, borderRadius: 10, padding: "6px 0", zIndex: 150, boxShadow: `0 12px 40px rgba(0,0,0,0.5), 0 0 0 1px ${th.border}33`, minWidth: 240, whiteSpace: "nowrap" }}>
+            <button className="tle-tb" onClick={() => setFileMenuOpen((v) => !v)} style={{ ...tb, color: fileMenuOpen ? th.accent : th.textDim }}>File ▾</button>
+            {fileMenuOpen && (<>
+              <div onClick={() => setFileMenuOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 149 }} />
+              <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: th.modalBg + "EE", backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)", border: `1px solid ${th.glassBorder}`, borderRadius: 10, padding: "6px 0", zIndex: 150, boxShadow: `0 12px 40px rgba(0,0,0,0.4), 0 0 0 1px ${th.glassBorder}`, minWidth: 220, whiteSpace: "nowrap" }}>
+                {[
+                  { label: "Open", shortcut: "⌘O", action: () => tle?.openFileDialog() },
+                  { label: "Export", shortcut: "⌘E", action: handleExport, disabled: !ct?.dataReady },
+                  { type: "separator" },
+                  { label: "Save Session", shortcut: "⌘S", action: handleSaveSession, disabled: tabs.length === 0 },
+                  { label: "Load Session", shortcut: "⇧⌘O", action: handleLoadSession },
+                  { type: "separator" },
+                  { label: "Open Recent", submenu: true },
+                  { type: "separator" },
+                  { label: "Close Tab", shortcut: "⌘W", action: () => { if (ct) closeTab(ct.id); }, disabled: !ct },
+                  { label: "Close All Tabs", action: () => { setTabs((prev) => { prev.forEach((t) => tle.closeTab(t.id)); return []; }); setActiveTab(null); }, disabled: tabs.length === 0 },
+                  { type: "separator" },
+                  { label: "Exit", action: () => window.close() },
+                ].map((item, i) => {
+                  if (item.type === "separator") return <div key={`sep-${i}`} style={{ height: 1, background: th.border, margin: "4px 12px" }} />;
+                  if (item.submenu) {
+                    return (
+                      <div key={item.label} style={{ position: "relative" }}
+                        onMouseEnter={(e) => { const el = e.currentTarget; el.dataset.hover = "1"; el.querySelector("[data-submenu]")?.style.setProperty("display", "block"); }}
+                        onMouseLeave={(e) => { const el = e.currentTarget; el.dataset.hover = ""; el.querySelector("[data-submenu]")?.style.setProperty("display", "none"); }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 16px", cursor: "default", fontSize: 13, fontFamily: "-apple-system, sans-serif", color: th.text }}>
+                          <span>{item.label}</span>
+                          <span style={{ fontSize: 10, color: th.textMuted, marginLeft: 12 }}>▶</span>
+                        </div>
+                        <div data-submenu style={{ display: "none", position: "absolute", left: "100%", top: -6, background: th.modalBg, border: `1px solid ${th.modalBorder}`, borderRadius: 10, padding: "6px 0", zIndex: 151, boxShadow: `0 12px 40px rgba(0,0,0,0.5), 0 0 0 1px ${th.border}33`, minWidth: 260, whiteSpace: "nowrap" }}>
+                          {recentFiles.length > 0 ? (<>
+                            {recentFiles.map((fp, ri) => (
+                              <div key={ri} onClick={() => { setFileMenuOpen(false); tle?.openRecentFile(fp); }}
+                                title={fp}
+                                style={{ padding: "6px 16px", cursor: "pointer", fontSize: 12, fontFamily: "-apple-system, sans-serif", color: th.text, overflow: "hidden", textOverflow: "ellipsis" }}
+                                onMouseEnter={(e) => e.currentTarget.style.background = th.selection}
+                                onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                                {fp.split("/").pop()}
+                                <div style={{ fontSize: 10, color: th.textMuted, marginTop: 1, overflow: "hidden", textOverflow: "ellipsis" }}>{fp}</div>
+                              </div>
+                            ))}
+                            <div style={{ height: 1, background: th.border, margin: "4px 12px" }} />
+                            <div onClick={() => { setFileMenuOpen(false); tle?.clearRecentFiles(); setRecentFiles([]); }}
+                              style={{ padding: "6px 16px", cursor: "pointer", fontSize: 12, fontFamily: "-apple-system, sans-serif", color: th.textMuted }}
+                              onMouseEnter={(e) => e.currentTarget.style.background = th.selection}
+                              onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                              Clear Recent Files
+                            </div>
+                          </>) : (
+                            <div style={{ padding: "6px 16px", fontSize: 12, fontFamily: "-apple-system, sans-serif", color: th.textMuted, fontStyle: "italic" }}>No recent files</div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div key={item.label} onClick={() => { if (!item.disabled) { setFileMenuOpen(false); item.action?.(); } }}
+                      style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 16px", cursor: item.disabled ? "default" : "pointer", fontSize: 13, fontFamily: "-apple-system, sans-serif", color: item.disabled ? th.textMuted : th.text, opacity: item.disabled ? 0.5 : 1 }}
+                      onMouseEnter={(e) => { if (!item.disabled) e.currentTarget.style.background = th.selection; }}
+                      onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                      <span>{item.label}</span>
+                      {item.shortcut && <span style={{ fontSize: 11, color: th.textMuted, marginLeft: 24 }}>{item.shortcut}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </>)}
+          </div>
+          {/* View menu */}
+          <div style={{ position: "relative" }}>
+            <button className="tle-tb" onClick={() => setViewMenuOpen((v) => !v)} style={{ ...tb, color: viewMenuOpen ? th.accent : th.textDim }}>View ▾</button>
+            {viewMenuOpen && (<>
+              <div onClick={() => setViewMenuOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 149 }} />
+              <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: th.modalBg + "EE", backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)", border: `1px solid ${th.glassBorder}`, borderRadius: 10, padding: "6px 0", zIndex: 150, boxShadow: `0 12px 40px rgba(0,0,0,0.4), 0 0 0 1px ${th.glassBorder}`, minWidth: 220, whiteSpace: "nowrap" }}>
                 {(() => {
                   const ic = (d, color) => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={color || th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>{d}</svg>;
                   const items = [
-                    { section: "View" },
                     { label: "Columns", icon: ic(<><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>), action: () => setModal({ type: "columns" }) },
                     { label: "Color Rules", icon: ic(<><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18" fill={th.accent} opacity="0.3"/></>), action: () => setModal({ type: "colors" }) },
                     { label: "Tags", icon: ic(<><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><circle cx="7" cy="7" r="1" fill={th.accent}/></>), action: () => setModal({ type: "tags" }) },
                     { label: "Filter Presets", icon: ic(<><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></>), action: () => setModal({ type: "presets" }) },
-                    { label: "Edit Filter", icon: ic(<><rect x="3" y="4" width="18" height="16" rx="2" fill="none"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="14" y2="13"/><line x1="7" y1="17" x2="11" y2="17"/></>), action: () => {
-                      if (ct?.dataReady) setModal({ type: "editFilter" });
-                    }, disabled: !ct?.dataReady },
+                    { label: "Edit Filter", icon: ic(<><rect x="3" y="4" width="18" height="16" rx="2" fill="none"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="14" y2="13"/><line x1="7" y1="17" x2="11" y2="17"/></>), action: () => { if (ct?.dataReady) setModal({ type: "editFilter" }); }, disabled: !ct?.dataReady },
                     { label: "Merge Tabs", icon: ic(<><rect x="4" y="4" width="16" height="6" rx="1"/><rect x="4" y="14" width="16" height="6" rx="1"/><line x1="12" y1="10" x2="12" y2="14" strokeDasharray="2,1"/></>), action: () => {
                       const ready = tabs.filter((t) => t.dataReady && !t.importing);
                       if (ready.length < 2) return;
@@ -2204,6 +2345,123 @@ export default function App() {
                         checked: true,
                       }))});
                     }, disabled: tabs.filter((t) => t.dataReady && !t.importing).length < 2 },
+                  ];
+                  return items.map((item) => (
+                    <button key={item.label} onClick={() => { setViewMenuOpen(false); item.action(); }} disabled={item.disabled}
+                      onMouseEnter={(e) => { if (!item.disabled) { e.currentTarget.style.background = `${th.accent}15`; e.currentTarget.style.borderLeft = `2px solid ${th.accent}`; e.currentTarget.style.paddingLeft = "12px"; } }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.borderLeft = "2px solid transparent"; e.currentTarget.style.paddingLeft = "12px"; }}
+                      style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "7px 14px 7px 12px", background: "none", border: "none", borderLeft: "2px solid transparent", color: item.disabled ? th.textMuted : th.text, fontSize: 13, cursor: item.disabled ? "default" : "pointer", textAlign: "left", fontFamily: "-apple-system, sans-serif", opacity: item.disabled ? 0.4 : 1, transition: "all 0.1s" }}>
+                      {item.icon}
+                      {item.label}
+                    </button>
+                  ));
+                })()}
+              </div>
+            </>)}
+          </div>
+          {/* Actions menu */}
+          <div style={{ position: "relative" }}>
+            <button className="tle-tb" onClick={() => setActionsMenuOpen((v) => !v)} style={{ ...tb, color: actionsMenuOpen ? th.accent : ct?.showBookmarkedOnly ? th.warning : th.textDim }}>Actions ▾</button>
+            {actionsMenuOpen && (<>
+              <div onClick={() => setActionsMenuOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 149 }} />
+              <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: th.modalBg + "EE", backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)", border: `1px solid ${th.glassBorder}`, borderRadius: 10, padding: "6px 0", zIndex: 150, boxShadow: `0 12px 40px rgba(0,0,0,0.4), 0 0 0 1px ${th.glassBorder}`, minWidth: 220, whiteSpace: "nowrap" }}>
+                {(() => {
+                  const ic = (d, color) => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={color || th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>{d}</svg>;
+                  const hasSelection = selectedRows.size > 0;
+                  const items = [
+                    { label: ct?.showBookmarkedOnly ? "Show All Rows" : "Show Flagged Only", icon: ic(ct?.showBookmarkedOnly ? <><path d="M1 4v10l7 7 10-10V1H8z" fill={th.accent+"22"}/><circle cx="13" cy="7" r="2"/><line x1="3" y1="18" x2="10" y2="11"/></> : <><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>, ct?.showBookmarkedOnly ? th.accent : th.textDim), action: () => { if (ct) up("showBookmarkedOnly", !ct.showBookmarkedOnly); } },
+                    { type: "separator" },
+                    { label: "Select All", icon: ic(<><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8M12 8v8"/></>), action: () => {
+                      if (!displayRows) return;
+                      const all = new Set();
+                      if (isGrouped) { for (let i = 0; i < displayRows.length; i++) { if (displayRows[i].type === "row") all.add(i); } }
+                      else { for (let i = 0; i < displayRows.length; i++) all.add(i); }
+                      setSelectedRows(all);
+                    }, disabled: !ct?.dataReady },
+                    { label: "Deselect All", icon: ic(<><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></>), action: () => { setSelectedRows(new Set()); }, disabled: !hasSelection },
+                    { label: "Invert Selection", icon: ic(<><rect x="3" y="3" width="18" height="18" rx="2" strokeDasharray="4 2"/><path d="M9 3v18M3 9h18" opacity="0.3"/></>), action: () => {
+                      if (!displayRows) return;
+                      const inv = new Set();
+                      if (isGrouped) { for (let i = 0; i < displayRows.length; i++) { if (displayRows[i].type === "row" && !selectedRows.has(i)) inv.add(i); } }
+                      else { for (let i = 0; i < displayRows.length; i++) { if (!selectedRows.has(i)) inv.add(i); } }
+                      setSelectedRows(inv);
+                    }, disabled: !ct?.dataReady },
+                    { type: "separator" },
+                    { label: "Copy Selected Rows", icon: ic(<><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></>), action: () => {
+                      if (!ct || selectedRows.size === 0) return;
+                      const hdrs = ct.headers.filter((h) => !ct.hiddenColumns?.has(h));
+                      const sortedIndices = [...selectedRows].sort((a, b) => a - b);
+                      const lines = [hdrs.join("\t")];
+                      for (const idx of sortedIndices) {
+                        const item = getRowAt(idx);
+                        const r = isGrouped ? (item?.type === "row" ? item.data : null) : item;
+                        if (r) lines.push(hdrs.map((h) => (r[h] || "").replace(/\t/g, " ")).join("\t"));
+                      }
+                      navigator.clipboard?.writeText(lines.join("\n"));
+                      setCopiedMsg(true);
+                      setTimeout(() => setCopiedMsg(false), 1200);
+                    }, disabled: !hasSelection },
+                    { label: "Export Selected Rows", icon: ic(<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></>), action: async () => {
+                      if (!ct || selectedRows.size === 0) return;
+                      const hdrs = ct.headers.filter((h) => !ct.hiddenColumns?.has(h));
+                      const sortedIndices = [...selectedRows].sort((a, b) => a - b);
+                      const lines = [hdrs.join(",")];
+                      for (const idx of sortedIndices) {
+                        const item = getRowAt(idx);
+                        const r = isGrouped ? (item?.type === "row" ? item.data : null) : item;
+                        if (r) lines.push(hdrs.map((h) => { const v = r[h] || ""; return v.includes(",") || v.includes('"') || v.includes("\n") ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(","));
+                      }
+                      const csv = lines.join("\n");
+                      const baseName = (ct.name || "export").replace(/\.[^.]+$/, "");
+                      if (window.tle?.saveTextFile) {
+                        await window.tle.saveTextFile(csv, `${baseName}_selected.csv`, [{ name: "CSV", extensions: ["csv"] }, { name: "TSV", extensions: ["tsv"] }]);
+                      } else {
+                        const blob = new Blob([csv], { type: "text/csv" });
+                        const a = document.createElement("a");
+                        a.href = URL.createObjectURL(blob);
+                        a.download = `${baseName}_selected.csv`;
+                        a.click();
+                        URL.revokeObjectURL(a.href);
+                      }
+                    }, disabled: !hasSelection },
+                    { type: "separator" },
+                    { label: "IOC Matching", icon: ic(<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill={(th.warning)+"22"}/></>), action: () => { if (ct?.dataReady) setModal({ type: "ioc", phase: "load", iocText: "", iocName: "", parsedIocs: [], fileName: null }); }, disabled: !ct?.dataReady },
+                    { label: "Bulk Tag / Bookmark", icon: ic(<><rect x="3" y="3" width="18" height="18" rx="3" fill={th.accent+"14"}/><path d="M8 12h8M12 8v8"/></>, th.accent), action: () => { if (ct?.dataReady) setModal({ type: "bulkActions", tagName: "", tagColor: "#E85D2A", result: null }); }, disabled: !ct?.dataReady },
+                    { type: "separator" },
+                    { label: "Pivot ±N Minutes", icon: ic(<><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>, th.accent), action: () => {
+                      if (!selectedRowData || !ct?.tsColumns?.size) return;
+                      const tsCols = [...(ct.tsColumns || new Set())];
+                      const autoCol = (ct?.sortCol && ct.tsColumns.has(ct.sortCol)) ? ct.sortCol : tsCols[0];
+                      setModal({ type: "proximity", pivotRow: selectedRowData, pivotCol: autoCol });
+                    }, disabled: !selectedRowData || !ct?.tsColumns?.size },
+                    { label: "Find Duplicates", icon: ic(<><rect x="4" y="4" width="12" height="12" rx="2"/><rect x="8" y="8" width="12" height="12" rx="2"/></>), action: () => {
+                      if (ct?.dataReady) setModal({ type: "findDuplicates", selCol: ct.headers?.[0] || "", result: null, loading: false });
+                    }, disabled: !ct?.dataReady },
+                  ];
+                  return items.map((item, i) => {
+                    if (item.type === "separator") return <div key={`sep-${i}`} style={{ height: 1, background: th.border, margin: "4px 12px" }} />;
+                    return (
+                      <button key={item.label} onClick={() => { setActionsMenuOpen(false); item.action(); }} disabled={item.disabled}
+                        onMouseEnter={(e) => { if (!item.disabled) { e.currentTarget.style.background = `${th.accent}15`; e.currentTarget.style.borderLeft = `2px solid ${th.accent}`; e.currentTarget.style.paddingLeft = "12px"; } }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.borderLeft = "2px solid transparent"; e.currentTarget.style.paddingLeft = "12px"; }}
+                        style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "7px 14px 7px 12px", background: "none", border: "none", borderLeft: "2px solid transparent", color: item.disabled ? th.textMuted : th.text, fontSize: 13, cursor: item.disabled ? "default" : "pointer", textAlign: "left", fontFamily: "-apple-system, sans-serif", opacity: item.disabled ? 0.4 : 1, transition: "all 0.1s" }}>
+                        {item.icon}
+                        {item.label}
+                      </button>
+                    );
+                  });
+                })()}
+              </div>
+            </>)}
+          </div>
+          <div style={{ position: "relative" }}>
+            <button className="tle-tb" onClick={() => setToolsOpen((v) => !v)} style={{ ...tb, color: toolsOpen ? th.accent : th.textDim }}>Tools ▾</button>
+            {toolsOpen && (<>
+              <div onClick={() => setToolsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 149 }} />
+              <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: th.modalBg + "EE", backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)", border: `1px solid ${th.glassBorder}`, borderRadius: 10, padding: "6px 0", zIndex: 150, boxShadow: `0 12px 40px rgba(0,0,0,0.4), 0 0 0 1px ${th.glassBorder}`, minWidth: 240, whiteSpace: "nowrap" }}>
+                {(() => {
+                  const ic = (d, color) => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={color || th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>{d}</svg>;
+                  const items = [
                     { section: "Analysis" },
                     { label: "Stack Values", icon: ic(<><line x1="4" y1="6" x2="16" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="12" y2="18"/></>), action: () => {
                       if (!ct?.headers?.length) return;
@@ -2218,7 +2476,6 @@ export default function App() {
                       }).then((result) => setModal((p) => p?.type === "stacking" ? { ...p, data: result, loading: false } : p))
                         .catch(() => setModal((p) => p?.type === "stacking" ? { ...p, loading: false, data: { entries: [], totalUnique: 0, totalRows: 0 } } : p));
                     }},
-                    { label: "IOC Matching", icon: ic(<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></>, th.warning), action: () => { if (ct?.dataReady) setModal({ type: "ioc", phase: "load", iocText: "", iocName: "", parsedIocs: [], fileName: null }); }, disabled: !ct?.dataReady },
                     { label: "Gap Analysis", icon: ic(<><circle cx="12" cy="12" r="9"/><polyline points="12 6 12 12 16 14"/></>, th.textDim), action: () => { if (ct?.dataReady && ct?.tsColumns?.size) setModal({ type: "gapAnalysis", phase: "config", colName: [...ct.tsColumns][0], gapThreshold: 60, data: null, loading: false }); }, disabled: !ct?.dataReady || !ct?.tsColumns?.size },
                     { label: "Log Sources", icon: ic(<><rect x="2" y="3" width="20" height="4" rx="1"/><rect x="2" y="10" width="20" height="4" rx="1"/><rect x="2" y="17" width="20" height="4" rx="1"/><circle cx="18" cy="5" r="1" fill={th.accent}/><circle cx="14" cy="12" r="1" fill={th.accent}/><circle cx="18" cy="19" r="1" fill={th.accent}/></>), action: () => {
                       if (!ct?.dataReady) return;
@@ -2310,8 +2567,6 @@ export default function App() {
                     }, disabled: !ct?.dataReady },
                     { section: "Export" },
                     { label: "Generate Report", icon: ic(<><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></>, th.success || "#3fb950"), action: async () => { if (ct?.dataReady) await tle.generateReport(ct.id, ct.name, ct.tagColors || {}); }, disabled: !ct?.dataReady },
-                    { section: "Help" },
-                    { label: "Keyboard Shortcuts", icon: ic(<><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M6 12h.01M18 12h.01M8 16h8"/></>), action: () => setModal({ type: "shortcuts" }) },
                   ];
                   return items.map((item, i) => item.section ? (
                     <div key={item.section} style={{ padding: i === 0 ? "2px 14px 4px" : "6px 14px 4px", borderTop: i === 0 ? "none" : `1px solid ${th.border}33`, marginTop: i === 0 ? 0 : 2 }}>
@@ -2330,7 +2585,36 @@ export default function App() {
               </div>
             </>)}
           </div>
-          <div style={tdv} />
+          <div style={{ position: "relative" }}>
+            <button className="tle-tb" onClick={() => setHelpMenuOpen((v) => !v)} style={{ ...tb, color: helpMenuOpen ? th.accent : th.textDim }}>Help ▾</button>
+            {helpMenuOpen && (<>
+              <div onClick={() => setHelpMenuOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 149 }} />
+              <div style={{ position: "absolute", top: "100%", left: 0, marginTop: 4, background: th.modalBg + "EE", backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)", border: `1px solid ${th.glassBorder}`, borderRadius: 10, padding: "6px 0", zIndex: 150, boxShadow: `0 12px 40px rgba(0,0,0,0.4), 0 0 0 1px ${th.glassBorder}`, minWidth: 220, whiteSpace: "nowrap" }}>
+                {[
+                  { label: "Quick Help", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>, action: () => setModal({ type: "quickHelp" }) },
+                  { label: "Keyboard Shortcuts", shortcut: "⌘/", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M6 12h.01M18 12h.01M8 16h8"/></svg>, action: () => setModal({ type: "shortcuts" }) },
+                  { type: "separator" },
+                  { label: "Website", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>, action: () => window.open("https://r3nzsec.github.io/irflow-timeline/", "_blank") },
+                  { label: "About IRFlow Timeline", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>, action: () => setModal({ type: "about" }) },
+                ].map((item, i) => {
+                  if (item.type === "separator") return <div key={`sep-${i}`} style={{ height: 1, background: th.border, margin: "4px 12px" }} />;
+                  return (
+                    <div key={item.label} onClick={() => { setHelpMenuOpen(false); item.action?.(); }}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 14px", cursor: "pointer", fontSize: 13, fontFamily: "-apple-system, sans-serif", color: th.text }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = th.selection}
+                      onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}>
+                      {item.icon}
+                      <span style={{ flex: 1 }}>{item.label}</span>
+                      {item.shortcut && <span style={{ fontSize: 11, color: th.textMuted }}>{item.shortcut}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </>)}
+          </div>
+          </div>{/* end menu capsule */}
+          {/* Settings capsule */}
+          <div style={{ display: "flex", alignItems: "center", gap: 4, background: th.glassBg, border: `1px solid ${th.glassBorder}`, borderRadius: 9, padding: "2px 6px" }}>
           <span style={{ color: th.textMuted, fontSize: 10 }}>⏱</span>
           <select value={dateTimeFormat} onChange={(e) => setDateTimeFormat(e.target.value)} style={{ background: th.btnBg, border: `1px solid ${th.btnBorder}`, color: th.textDim, fontSize: 10, padding: "3px 5px", borderRadius: 4, cursor: "pointer", outline: "none" }}>
             {DT_FORMATS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
@@ -2338,19 +2622,19 @@ export default function App() {
           <select value={timezone} onChange={(e) => setTimezone(e.target.value)} style={{ background: th.btnBg, border: `1px solid ${th.btnBorder}`, color: th.textDim, fontSize: 10, padding: "3px 5px", borderRadius: 4, cursor: "pointer", outline: "none" }}>
             {TIMEZONES.map((tz) => <option key={tz.value} value={tz.value}>{tz.label}</option>)}
           </select>
-          <div style={tdv} />
-          <button onClick={() => setThemeName((p) => p === "dark" ? "light" : "dark")} style={tb} title="Toggle theme">{themeName === "dark" ? "☀" : "🌙"}</button>
-          <div style={tdv} />
+          <span style={{ width: 1, height: 14, background: th.glassBorder, display: "inline-block" }} />
+          <button className="tle-tb" onClick={() => setThemeName((p) => p === "dark" ? "light" : "dark")} style={{ ...tb, padding: "4px 8px" }} title="Toggle theme">{themeName === "dark" ? "☀" : "🌙"}</button>
+          <span style={{ width: 1, height: 14, background: th.glassBorder, display: "inline-block" }} />
           <span style={{ color: th.textMuted, fontSize: 10 }}>A</span>
-          <button onClick={() => setFontSize((s) => Math.max(9, s - 1))} style={{ ...tb, fontSize: 11, padding: "3px 5px" }} title="Decrease font size">−</button>
+          <button className="tle-tb" onClick={() => setFontSize((s) => Math.max(9, s - 1))} style={{ ...tb, fontSize: 11, padding: "3px 5px" }} title="Decrease font size">−</button>
           <span style={{ color: th.textDim, fontSize: 10, minWidth: 18, textAlign: "center" }}>{fontSize}</span>
-          <button onClick={() => setFontSize((s) => Math.min(18, s + 1))} style={{ ...tb, fontSize: 11, padding: "3px 5px" }} title="Increase font size">+</button>
-          <div style={tdv} />
-          <button onClick={() => setHistogramVisible((v) => !v)} style={{ ...tb, color: histogramVisible ? th.accent : th.textDim }} title="Toggle timeline histogram">
+          <button className="tle-tb" onClick={() => setFontSize((s) => Math.min(18, s + 1))} style={{ ...tb, fontSize: 11, padding: "3px 5px" }} title="Increase font size">+</button>
+          <span style={{ width: 1, height: 14, background: th.glassBorder, display: "inline-block" }} />
+          <button className="tle-tb" onClick={() => setHistogramVisible((v) => !v)} style={{ ...tb, color: histogramVisible ? th.accent : th.textDim, padding: "4px 8px" }} title="Toggle timeline histogram">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="12" width="4" height="9" rx="1" /><rect x="10" y="6" width="4" height="15" rx="1" /><rect x="17" y="3" width="4" height="18" rx="1" /></svg>
           </button>
-          {proximityFilter && ct?.dateRangeFilters?.[proximityFilter.tsCol] && (<>
-            <div style={tdv} />
+          </div>{/* end settings capsule */}
+          {proximityFilter && ct?.dateRangeFilters?.[proximityFilter.tsCol] && (
             <span style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 8px", background: `${th.warning}22`, border: `1px solid ${th.warning}4D`, borderRadius: 10, color: th.warning, fontSize: 10, fontFamily: "-apple-system,sans-serif", whiteSpace: "nowrap" }}
               title={`Proximity: ±${proximityFilter.label} around ${proximityFilter.pivotRaw}`}>
               ⏱ ±{proximityFilter.label}
@@ -2358,9 +2642,9 @@ export default function App() {
               <button onClick={() => { const next = { ...(ct?.dateRangeFilters || {}) }; delete next[proximityFilter.tsCol]; up("dateRangeFilters", next); setProximityFilter(null); }}
                 style={{ background: "none", border: "none", color: th.warning, cursor: "pointer", fontSize: 10, padding: "0 0 0 2px", lineHeight: 1 }} title="Clear proximity filter">✕</button>
             </span>
-          </>)}
+          )}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, maxWidth: 560, background: th.bgInput, border: `1px solid ${th.border}`, borderRadius: 6, padding: "0 8px", WebkitAppRegion: "no-drag" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, maxWidth: 560, background: th.glassBg, border: `1px solid ${th.glassBorder}`, borderRadius: 9, padding: "0 10px", WebkitAppRegion: "no-drag" }}>
           {searchLoading && ct?.searchTerm ? (
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={th.accent} strokeWidth="2.5" style={{ animation: "tle-spin 0.8s linear infinite", flexShrink: 0 }}>
               <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" /></svg>
@@ -2505,9 +2789,9 @@ export default function App() {
       )}
 
       {/* Tabs */}
-      <div style={{ display: "flex", background: th.panelBg, borderBottom: `1px solid ${th.border}`, overflowX: "auto", flexShrink: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 12px", background: th.panelBg, borderBottom: `1px solid ${th.glassBorder}`, overflowX: "auto", flexShrink: 0 }}>
         {tabs.filter((t) => !tabFilter || t.name.toLowerCase().includes(tabFilter.toLowerCase())).map((t) => (
-          <div key={t.id} onClick={() => {
+          <div className="tle-tab" key={t.id} onClick={() => {
             if (activeTab) tabScrollPos.current[activeTab] = { scrollTop, selectedRows, lastClickedRow };
             const saved = tabScrollPos.current[t.id];
             setActiveTab(t.id);
@@ -2519,18 +2803,19 @@ export default function App() {
               requestAnimationFrame(() => { if (scrollRef.current) scrollRef.current.scrollTop = saved.scrollTop; });
             }
           }}
-            style={{ display: "flex", alignItems: "center", gap: 5, padding: "6px 12px", cursor: "pointer", borderRight: `1px solid ${th.border}`, color: t.id === activeTab ? th.text : th.textDim, fontSize: 11, fontFamily: "-apple-system, sans-serif", whiteSpace: "nowrap", background: t.id === activeTab ? th.bgAlt : th.panelBg, borderBottom: t.id === activeTab ? `2px solid ${th.borderAccent}` : "2px solid transparent", borderTop: t.id === activeTab ? `2px solid ${th.borderAccent}` : "2px solid transparent" }}>
+            style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 14px", cursor: "pointer", color: t.id === activeTab ? th.text : th.textDim, fontSize: 11, fontFamily: "-apple-system, sans-serif", whiteSpace: "nowrap", background: t.id === activeTab ? th.glassBg : "transparent", border: t.id === activeTab ? `1px solid ${th.glassBorder}` : "1px solid transparent", borderRadius: 8, boxShadow: t.id === activeTab ? `0 1px 3px rgba(0,0,0,0.15), inset 0 1px 0 ${th.glassBorder}` : "none" }}>
             {t.importing && <span style={{ color: th.warning }}>⏳</span>}
+            {t.id === activeTab && <span style={{ width: 6, height: 6, borderRadius: 3, background: th.accent, flexShrink: 0 }} />}
             <span style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>{t.name}</span>
             <span style={{ color: th.textMuted, fontSize: 10 }}>({formatNumber(t.totalRows || 0)})</span>
-            <button onClick={(e) => { e.stopPropagation(); closeTab(t.id); }} style={{ background: "none", border: "none", color: th.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px" }}>✕</button>
+            <button onClick={(e) => { e.stopPropagation(); closeTab(t.id); }} style={{ background: "none", border: "none", color: th.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px", borderRadius: 3 }}>✕</button>
           </div>
         ))}
         {tabs.length >= 3 && (
-          <div style={{ display: "flex", alignItems: "center", marginLeft: "auto", flexShrink: 0, padding: "0 8px" }}>
+          <div style={{ display: "flex", alignItems: "center", marginLeft: "auto", flexShrink: 0, padding: "0 4px" }}>
             <input value={tabFilter} onChange={(e) => setTabFilter(e.target.value)}
               placeholder="Filter tabs..."
-              style={{ width: 110, padding: "2px 6px", background: th.bgInput, border: `1px solid ${th.border}`, borderRadius: 4, color: th.text, fontSize: 10, outline: "none", fontFamily: "-apple-system, sans-serif" }} />
+              style={{ width: 110, padding: "2px 6px", background: th.glassBg, border: `1px solid ${th.glassBorder}`, borderRadius: 6, color: th.text, fontSize: 10, outline: "none", fontFamily: "-apple-system, sans-serif" }} />
             {tabFilter && <button onClick={() => setTabFilter("")} style={{ background: "none", border: "none", color: th.textMuted, cursor: "pointer", fontSize: 10, padding: "0 3px", marginLeft: 2 }}>✕</button>}
           </div>
         )}
@@ -2844,13 +3129,16 @@ export default function App() {
               {/* Header */}
               <div style={{ display: "flex", position: "sticky", top: 0, zIndex: 10, background: th.headerBg, borderBottom: `2px solid ${th.borderAccent}` }}>
                 {/* # column - always sticky */}
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: BKMK_COL_WIDTH, minWidth: BKMK_COL_WIDTH, height: HEADER_HEIGHT, color: th.textMuted, fontSize: 10, fontWeight: 600, position: "sticky", left: 0, zIndex: 13, background: th.headerBg }}>#</div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 2, width: isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH), minWidth: isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH), height: HEADER_HEIGHT, color: th.textMuted, fontSize: 10, fontWeight: 600, position: "sticky", left: 0, zIndex: 13, background: th.headerBg }}>
+                  <span>#</span>
+                  {!isGrouped && <span style={{ cursor: "pointer", marginLeft: 2 }} onClick={() => { const allVis = new Set(); for (let i = 0; i < displayRows.length; i++) allVis.add(i); setSelectedRows(selectedRows.size === displayRows.length ? new Set() : allVis); }} title={selectedRows.size === displayRows.length ? "Deselect all" : "Select all"}><CheckboxIcon checked={selectedRows.size > 0 && selectedRows.size === displayRows.length} indeterminate={selectedRows.size > 0 && selectedRows.size < displayRows.length} /></span>}
+                </div>
                 {/* Tags column header — sticky, resizable, standard style */}
                 <div
                   onClick={(e) => { if (e.metaKey || e.ctrlKey) { e.preventDefault(); e.stopPropagation(); setContextMenu({ x: e.clientX, y: e.clientY, colName: "__tags__" }); return; } handleSort("__tags__"); }}
                   onDoubleClick={() => { clearTimeout(sortTimerRef.current); }}
                   onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setContextMenu({ x: e.clientX, y: e.clientY, colName: "__tags__" }); }}
-                  style={{ display: "flex", alignItems: "center", height: HEADER_HEIGHT, width: tagColWidth, minWidth: tagColWidth, boxSizing: "border-box", padding: "0 8px", cursor: "pointer", userSelect: "none", fontWeight: 600, color: th.headerText, fontSize: 11, borderRight: `1px solid ${th.border}`, position: "sticky", left: BKMK_COL_WIDTH, zIndex: 12, background: th.headerBg, overflow: "hidden" }}>
+                  style={{ display: "flex", alignItems: "center", height: HEADER_HEIGHT, width: tagColWidth, minWidth: tagColWidth, boxSizing: "border-box", padding: "0 8px", cursor: "pointer", userSelect: "none", fontWeight: 600, color: th.headerText, fontSize: 11, borderRight: `1px solid ${th.border}`, position: "sticky", left: isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH), zIndex: 12, background: th.headerBg, overflow: "hidden" }}>
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>Tags</span>
                   {ct.sortCol === "__tags__" && <span style={{ fontSize: 9, color: th.accent, marginLeft: 3 }}>{ct.sortDir === "asc" ? "▲" : "▼"}</span>}
                   <div onMouseDown={(e) => {
@@ -2906,7 +3194,7 @@ export default function App() {
               {/* Filters */}
               <div style={{ display: "flex", position: "sticky", top: HEADER_HEIGHT, zIndex: 10, background: th.bg, borderBottom: `1px solid ${th.border}` }}>
                 {/* # filter placeholder */}
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: BKMK_COL_WIDTH, minWidth: BKMK_COL_WIDTH, height: FILTER_HEIGHT, position: "sticky", left: 0, zIndex: 11, background: th.bg }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH), minWidth: isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH), height: FILTER_HEIGHT, position: "sticky", left: 0, zIndex: 11, background: th.bg }}>
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={th.textMuted} strokeWidth="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" /></svg>
                 </div>
                 {/* Tags filter cell — standard layout with text input + dropdown */}
@@ -2916,7 +3204,7 @@ export default function App() {
                   const hasFilter = !!(hasTextFilter || hasCbf);
                   const isDis = ct.disabledFilters?.has("__tags__");
                   return (
-                    <div style={{ width: tagColWidth, minWidth: tagColWidth, boxSizing: "border-box", padding: "0 2px", display: "flex", alignItems: "center", height: FILTER_HEIGHT, borderRight: `1px solid ${th.border}`, position: "sticky", left: BKMK_COL_WIDTH, zIndex: 11, background: th.bg }}>
+                    <div style={{ width: tagColWidth, minWidth: tagColWidth, boxSizing: "border-box", padding: "0 2px", display: "flex", alignItems: "center", height: FILTER_HEIGHT, borderRight: `1px solid ${th.border}`, position: "sticky", left: isGrouped ? (16 + 26 + CHECKBOX_COL_WIDTH) : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH), zIndex: 11, background: th.bg }}>
                       {hasFilter && <button onClick={() => { const s = new Set(ct.disabledFilters || []); if (s.has("__tags__")) s.delete("__tags__"); else s.add("__tags__"); up("disabledFilters", s); }}
                         style={{ background: "none", border: "none", cursor: "pointer", padding: "1px 2px", color: isDis ? th.danger : th.success, fontSize: 9, flexShrink: 0, lineHeight: 1, opacity: 0.8 }} title={isDis ? "Enable filter" : "Disable filter"}>{isDis ? "⊘" : "⊙"}</button>}
                       <input value={ct.columnFilters["__tags__"] || ""} onChange={(e) => up("columnFilters", { ...ct.columnFilters, "__tags__": e.target.value })} placeholder="Filter..."
@@ -2977,9 +3265,18 @@ export default function App() {
                   if (isGrouped && item.type === "group") {
                     const isExpanded = ct.expandedGroups?.[item.pathKey] !== undefined;
                     const indent = (item.depth || 0) * 20 + 12;
+                    const gcs = isExpanded ? getGroupCheckState(ai, item.depth) : null;
                     return (
                       <div key={`g-${item.pathKey}`} onClick={() => isExpanded ? collapseGroup(item.pathKey) : expandGroup(item.pathKey, item.filters, item.depth + 1)}
                         style={{ display: "flex", alignItems: "center", height: ROW_HEIGHT, position: "absolute", top: ai * ROW_HEIGHT, width: tw, background: th.bgAlt, cursor: "pointer", borderBottom: `1px solid ${th.border}`, paddingLeft: indent, gap: 8 }}>
+                        {isExpanded && gcs && gcs.total > 0 && (
+                          <div onClick={(e) => { e.stopPropagation(); handleGroupSelectAll(ai); }}
+                            style={{ display: "flex", alignItems: "center", cursor: "pointer", flexShrink: 0 }}>
+                            <CheckboxIcon
+                              checked={gcs.selected === gcs.total}
+                              indeterminate={gcs.selected > 0 && gcs.selected < gcs.total} />
+                          </div>
+                        )}
                         <span style={{ color: th.accent, fontSize: 10, width: 14, textAlign: "center", flexShrink: 0 }}>{isExpanded ? "▼" : "▶"}</span>
                         <span style={{ color: th.text, fontSize: 12, fontWeight: 600, fontFamily: "-apple-system, sans-serif" }}>{item.colName}:</span>
                         <span style={{ color: th.text, fontSize: 12, fontFamily: "-apple-system, sans-serif" }}>{item.value || "(empty)"}</span>
@@ -3025,14 +3322,19 @@ export default function App() {
                       style={{ display: "flex", height: ROW_HEIGHT, position: "absolute", top: ai * ROW_HEIGHT, width: tw,
                         background: rowBg, color: cm ? cm.fg : th.text, borderBottom: `1px solid ${th.cellBorder}`,
                         boxShadow: sel ? `inset 2px 0 0 0 ${th.borderAccent}` : "none", cursor: "default",
-                        paddingLeft: isGrouped ? rowDepth * 20 + 16 : 0 }}>
+                        paddingLeft: isGrouped ? 16 : 0 }}>
                       {/* Bookmark - always sticky */}
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: isGrouped ? 26 : BKMK_COL_WIDTH, minWidth: isGrouped ? 26 : BKMK_COL_WIDTH, cursor: "pointer", position: "sticky", left: isGrouped ? 16 : 0, zIndex: 3, background: stickyBase, boxShadow: stickyOverlay }}
                         onClick={(e) => { e.stopPropagation(); handleBookmark(row.__idx); }}>
                         <BkmkIcon filled={bm} />
                       </div>
+                      {/* Checkbox cell */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", width: CHECKBOX_COL_WIDTH, minWidth: CHECKBOX_COL_WIDTH, position: "sticky", left: isGrouped ? 42 : BKMK_COL_WIDTH, zIndex: 3, background: stickyBase, boxShadow: stickyOverlay, cursor: "pointer" }}
+                        onClick={(e) => { e.stopPropagation(); handleCheckboxToggle(ai); }}>
+                        <CheckboxIcon checked={sel} />
+                      </div>
                       {/* Tags cell — sticky */}
-                      <div style={{ display: "flex", alignItems: "center", gap: 2, width: tagColWidth, minWidth: tagColWidth, padding: "0 4px", overflow: "hidden", borderRight: `1px solid ${th.cellBorder}`, position: "sticky", left: isGrouped ? 42 : BKMK_COL_WIDTH, zIndex: 2, background: stickyBase, boxShadow: stickyOverlay }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 2, width: tagColWidth, minWidth: tagColWidth, padding: "0 4px", overflow: "hidden", borderRight: `1px solid ${th.cellBorder}`, position: "sticky", left: isGrouped ? 42 + CHECKBOX_COL_WIDTH : (BKMK_COL_WIDTH + CHECKBOX_COL_WIDTH), zIndex: 2, background: stickyBase, boxShadow: stickyOverlay }}>
                         {rTags.map((tag) => (
                           <span key={tag} style={{ padding: "0 4px", borderRadius: 3, fontSize: 9, background: ((ct.tagColors || {})[tag] || th.textMuted) + "33", color: (ct.tagColors || {})[tag] || th.textDim, whiteSpace: "nowrap", lineHeight: "16px" }}>{tag}</span>
                         ))}
@@ -3110,10 +3412,10 @@ export default function App() {
       {ct && ct.dataReady && (
         <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 12px", background: th.bgAlt, borderTop: `1px solid ${th.border}`, fontSize: 11, color: th.textDim, flexShrink: 0, fontFamily: "-apple-system, sans-serif" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <span style={{ color: th.accent, fontWeight: 500, cursor: "pointer" }}
+            <span style={{ color: th.accent, fontWeight: 500, cursor: "pointer", maxWidth: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "inline-block", verticalAlign: "middle" }}
               title={ct.filePath ? `Double-click to copy: ${ct.filePath}` : ct.name}
               onDoubleClick={() => { if (ct.filePath) { navigator.clipboard.writeText(ct.filePath); setCopiedMsg(true); setTimeout(() => setCopiedMsg(false), 1200); } }}>
-              {ct.name}
+              {ct.filePath || ct.name}
             </span>
             <Sdiv /><span>Total: <b>{formatNumber(ct.totalRows)}</b></span>
             {!isGrouped && <><Sdiv /><span>Filtered: <b style={{ color: ct.totalFiltered < ct.totalRows ? th.warning : th.success, opacity: searchLoading ? 0.5 : 1, transition: "opacity 0.15s" }}>{formatNumber(ct.totalFiltered)}</b>{searchLoading && <span style={{ color: th.accent, marginLeft: 3 }}>...</span>}</span></>}
@@ -3121,7 +3423,7 @@ export default function App() {
             {isGrouped && <><Sdiv /><span>Groups: <b style={{ color: th.accent }}>{ct.groupData?.length || 0}</b></span></>}
             {ct.bookmarkedSet?.size > 0 && <><Sdiv /><span>Flagged: <b style={{ color: th.warning }}>{ct.bookmarkedSet.size}</b></span></>}
             {ct.sortCol && ct.sortCol !== "__tags__" && <><Sdiv /><span>Sort: {ct.sortCol} {ct.sortDir === "asc" ? "↑" : "↓"}</span></>}
-            {selectedRows.size > 0 && !isGrouped && <><Sdiv /><span>{selectedRows.size === 1 ? `Row: ${(lastClickedRow ?? 0) + 1}` : `${selectedRows.size} rows selected`}</span></>}
+            {selectedRows.size > 0 && <><Sdiv /><span>{selectedRows.size === 1 ? `Row: ${(lastClickedRow ?? 0) + 1}` : `${selectedRows.size} rows selected`}</span></>}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             {copiedMsg && <span style={{ color: th.success }}>Copied!</span>}
@@ -3547,6 +3849,117 @@ export default function App() {
       {modal?.type === "colors" && ct && <ColorModal />}
       {modal?.type === "columns" && ct && <ColModal />}
       {modal?.type === "shortcuts" && <ShortModal />}
+      {modal?.type === "quickHelp" && (
+        <div style={{ position: "fixed", inset: 0, background: th.overlay, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, backdropFilter: "blur(4px)", WebkitAppRegion: "drag" }}>
+          <div style={{ background: th.modalBg, border: `1px solid ${th.modalBorder}`, borderRadius: 12, padding: 0, width: 620, maxWidth: "92vw", maxHeight: "85vh", overflow: "hidden", boxShadow: "0 24px 48px rgba(0,0,0,0.5)", WebkitAppRegion: "no-drag", display: "flex", flexDirection: "column" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 24px", borderBottom: `1px solid ${th.border}`, flexShrink: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={th.accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                <span style={{ fontSize: 16, fontWeight: 600, color: th.text, fontFamily: "-apple-system, sans-serif" }}>Quick Help</span>
+              </div>
+              <button onClick={() => setModal(null)} style={{ background: "none", border: "none", color: th.textMuted, cursor: "pointer", fontSize: 18, padding: "2px 6px" }}>✕</button>
+            </div>
+            <div style={{ overflow: "auto", padding: "20px 24px", fontSize: 12.5, color: th.text, lineHeight: 1.7, fontFamily: "-apple-system, sans-serif" }}>
+              {(() => {
+                const S = ({ children }) => <h3 style={{ fontSize: 13, fontWeight: 700, color: th.accent, marginTop: 18, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>{children}</h3>;
+                const P = ({ children }) => <p style={{ margin: "0 0 8px", color: th.text }}>{children}</p>;
+                const Li = ({ children }) => <div style={{ display: "flex", gap: 8, marginBottom: 4 }}><span style={{ color: th.accent, flexShrink: 0 }}>-</span><span>{children}</span></div>;
+                const K = ({ children }) => <span style={{ background: th.bgAlt, border: `1px solid ${th.border}`, borderRadius: 4, padding: "1px 5px", fontSize: 11, fontFamily: "monospace", color: th.textDim }}>{children}</span>;
+                return (<>
+                  <P>IRFlow Timeline can open CSV, TSV, TXT, LOG, XLSX, XLS, EVTX, and Plaso files and display them in a high-performance SQLite-backed grid. Files are imported in-memory for fast querying — there is no row limit.</P>
+
+                  <S>Supported Formats</S>
+                  <Li><b>CSV / TSV / TXT / LOG</b> — Auto-delimiter detection, streaming import. Handles multi-GB files.</Li>
+                  <Li><b>XLSX / XLS / XLSM</b> — Streaming reader for XLSX, SheetJS for legacy XLS. Multi-sheet support with sheet picker.</Li>
+                  <Li><b>EVTX</b> — Windows Event Log binary files. Parsed natively with full field extraction, provider resolution, and PayloadData mapping.</Li>
+                  <Li><b>Plaso</b> — log2timeline/Plaso SQLite output files. All event sources and timestamps preserved.</Li>
+
+                  <S>Search Modes</S>
+                  <Li><b>Mixed</b> — Uses FTS (full-text search) when available, falls back to LIKE. Best for general use.</Li>
+                  <Li><b>FTS</b> — SQLite FTS5 full-text search. Fast keyword matching across all columns.</Li>
+                  <Li><b>LIKE</b> — SQL LIKE pattern matching. Supports <K>%</K> (any chars) and <K>_</K> (single char) wildcards.</Li>
+                  <Li><b>Fuzzy</b> — Approximate matching with configurable distance. Finds near-matches and typos.</Li>
+                  <Li><b>Regex</b> — Full regular expression support. Use for complex pattern matching.</Li>
+                  <P>Prefix with <K>+AND</K> to require all terms, <K>-NOT</K> to exclude terms, or wrap in <K>"quotes"</K> for exact phrase matching.</P>
+
+                  <S>Column Filters</S>
+                  <P>Each column has a text filter input and a dropdown (▼) for value-based checkbox filtering. Filters can be combined across columns. Use the toggle button to temporarily disable individual filters without clearing them.</P>
+                  <Li><b>Date range filter</b> — Click the ⏱ icon on timestamp columns to filter by date range.</Li>
+                  <Li><b>Advanced filter</b> — Use "Edit Filter" in the status bar for complex AND/OR filter logic.</Li>
+
+                  <S>Grouping</S>
+                  <P>Right-click any column header and select "Group by this column" to group rows. Multiple columns can be grouped hierarchically. Click the expand arrow (▶) to reveal rows within a group. Use the checkbox on group headers to select all rows in that group for copying.</P>
+
+                  <S>Tagging & Bookmarks</S>
+                  <Li><b>Tags</b> — Right-click any row to add colored tags. Tags are searchable, filterable, and visible in the Tags column. Each tag gets a unique color from the preset palette.</Li>
+                  <Li><b>Bookmarks</b> — Click the bookmark icon (flag) on any row. Use <K>⌘B</K> to toggle "Flagged Only" view.</Li>
+                  <Li><b>Bulk tagging</b> — Use Bulk Actions to tag all filtered/visible rows at once, or tag by time ranges from the histogram.</Li>
+                  <Li><b>IOC tagging</b> — Load IOC files (CSV, XLSX, TSV) and auto-tag matching rows with per-IOC tags.</Li>
+
+                  <S>Timeline Histogram</S>
+                  <P>The histogram at the top shows event distribution over time. Click and drag to brush-select a time range — this filters the grid to only show events in that window. Toggle between Day/Hour/Minute granularity. Use the histogram to identify activity bursts and gaps.</P>
+
+                  <S>DFIR Analysis Tools</S>
+                  <Li><b>Process Inspector</b> — Builds parent-child process trees from Sysmon EID 1 and Security 4688 events. Includes 340+ MITRE ATT&CK detection rules for suspicious process chains (e.g., Office spawning PowerShell, LOLBin execution). Shows integrity levels, PID/PPID, and command lines with chain-based detection labels.</Li>
+                  <Li><b>Lateral Movement Tracker</b> — Visualizes network logon events (4624, 4625, 4648) and RDP sessions (TerminalServices EIDs 21-25, 39, 40, 1149) as an interactive force-directed graph. Detects multi-hop chains, suspicious hostnames, cleartext logons, and supports 13 built-in detection rules plus custom rules.</Li>
+                  <Li><b>Persistence Analyzer</b> — Scans EVTX logs and registry exports for 30+ persistence techniques: scheduled tasks, services, WMI subscriptions, registry autoruns, startup folder drops, DLL hijacking, COM hijacking, and more. Risk-scored 0-10 with suspicious pattern detection.</Li>
+                  <Li><b>IOC Matching</b> — Supports 17+ IOC categories: IPv4, IPv6, domains, URLs, hashes (MD5/SHA1/SHA256), emails, file paths, registry keys, named pipes, mutexes, crypto wallets, user agents, JARM/JA3 hashes. Auto-defangs indicators. Results highlighted inline in the grid.</Li>
+                  <Li><b>Gap Analysis</b> — Finds time gaps exceeding a configurable threshold. Useful for identifying periods of missing log coverage.</Li>
+                  <Li><b>Burst Detection</b> — Identifies abnormal spikes in event frequency using statistical analysis. Highlights potential brute-force or automated activity.</Li>
+                  <Li><b>Log Source Coverage</b> — Heatmap showing which log sources have data across the timeline. Helps identify collection gaps.</Li>
+                  <Li><b>Stacking</b> — Value frequency analysis on any column. Shows unique value counts with distribution bars — the DFIR equivalent of "stack and count" for identifying outliers.</Li>
+
+                  <S>Export & Reporting</S>
+                  <Li><b>Export</b> — Export the current filtered view as CSV, TSV, XLSX, or XLS. Only visible/filtered rows are exported.</Li>
+                  <Li><b>HTML Report</b> — Generate a standalone HTML report with tagged/bookmarked rows, color-coded by tag. Shareable without any tools needed.</Li>
+                  <Li><b>Sessions</b> — Save your entire workspace (tabs, filters, tags, bookmarks, color rules) as a .tle session file. Reload later to pick up exactly where you left off.</Li>
+
+                  <S>Tips</S>
+                  <Li>Drag column headers to reorder. Double-click a header divider to auto-fit column width.</Li>
+                  <Li>Right-click column headers for options: pin, hide, group, sort, stacking, stats.</Li>
+                  <Li><K>⌘C</K> copies selected rows as tab-separated text (with headers). Works in both normal and grouped mode.</Li>
+                  <Li>Double-click any cell to see its full content in a popup.</Li>
+                  <Li>Drop files directly onto the window to import them.</Li>
+                  <Li>The status bar (bottom) shows active filters, row counts, and sort state. Double-click the file path to copy it.</Li>
+                </>);
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+      {modal?.type === "about" && (
+        <Overlay>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 40, marginBottom: 8 }}>⌬</div>
+            <h2 style={{ margin: "0 0 4px", fontSize: 20, fontWeight: 700, color: th.text, fontFamily: "-apple-system, sans-serif" }}>IRFlow Timeline</h2>
+            <div style={{ fontSize: 12, color: th.textMuted, marginBottom: 16, fontFamily: "-apple-system, sans-serif" }}>Version 1.0.2-beta</div>
+            <div style={{ textAlign: "left", background: th.bgAlt, borderRadius: 8, padding: 16, marginBottom: 16 }}>
+              <p style={{ margin: "0 0 8px", fontSize: 12, color: th.text, lineHeight: 1.6, fontFamily: "-apple-system, sans-serif" }}>
+                A high-performance native macOS timeline analysis tool built for DFIR professionals, capable of ingesting millions of rows from CSV, XLSX, EVTX, and Plaso files without breaking a sweat.
+              </p>
+              <p style={{ margin: "0 0 8px", fontSize: 12, color: th.text, lineHeight: 1.6, fontFamily: "-apple-system, sans-serif" }}>
+                Powered by SQLite with automated threat detection — including process tree chain analysis with 340+ MITRE ATT&CK rules, lateral movement tracking with RDP session correlation, and persistence mechanism identification across 30+ techniques.
+              </p>
+              <p style={{ margin: 0, fontSize: 12, color: th.text, lineHeight: 1.6, fontFamily: "-apple-system, sans-serif" }}>
+                Designed to replace legacy Windows-only forensic viewers with a modern, fast, and intuitive experience — from IOC matching and timeline histograms to color-coded tagging and one-click HTML report generation.
+              </p>
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: th.text, marginBottom: 8, fontFamily: "-apple-system, sans-serif" }}>Author</div>
+              <div style={{ fontSize: 13, color: th.text, marginBottom: 6, fontFamily: "-apple-system, sans-serif" }}>Renzon Cruz</div>
+              <div style={{ display: "flex", justifyContent: "center", gap: 16 }}>
+                <a href="#" onClick={(e) => { e.preventDefault(); window.open?.("https://www.linkedin.com/in/renzoncruz") || window.location.assign("https://www.linkedin.com/in/renzoncruz"); }}
+                  style={{ fontSize: 12, color: th.accent, textDecoration: "none", cursor: "pointer", fontFamily: "-apple-system, sans-serif" }}>LinkedIn</a>
+                <a href="#" onClick={(e) => { e.preventDefault(); window.open?.("https://x.com/r3nzsec") || window.location.assign("https://x.com/r3nzsec"); }}
+                  style={{ fontSize: 12, color: th.accent, textDecoration: "none", cursor: "pointer", fontFamily: "-apple-system, sans-serif" }}>Twitter</a>
+                <a href="#" onClick={(e) => { e.preventDefault(); window.open?.("https://github.com/r3nzsec/irflow-timeline") || window.location.assign("https://github.com/r3nzsec/irflow-timeline"); }}
+                  style={{ fontSize: 12, color: th.accent, textDecoration: "none", cursor: "pointer", fontFamily: "-apple-system, sans-serif" }}>GitHub</a>
+              </div>
+            </div>
+            <button onClick={() => setModal(null)} style={ms.bp}>OK</button>
+          </div>
+        </Overlay>
+      )}
       {modal?.type === "sheets" && <SheetModal />}
       {modal?.type === "tags" && ct && (
         <Overlay>
@@ -3699,6 +4112,74 @@ export default function App() {
             </div>
             <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 6 }}>
               <button onClick={() => setModal(null)} style={ms.bs}>Cancel</button>
+            </div>
+          </Overlay>
+        );
+      })()}
+
+      {/* Find Duplicates Modal */}
+      {modal?.type === "findDuplicates" && ct && (() => {
+        const selCol = modal.selCol || ct.headers?.[0] || "";
+        const result = modal.result;
+        const loading = modal.loading;
+        const handleFindDuplicates = async () => {
+          setModal((p) => ({ ...p, loading: true, result: null }));
+          const af = activeFilters(ct);
+          const values = await tle.getColumnUniqueValues(ct.id, selCol, {
+            searchTerm: ct.searchHighlight ? "" : ct.searchTerm, searchMode: ct.searchMode, searchCondition: ct.searchCondition || "contains",
+            columnFilters: af.columnFilters, checkboxFilters: af.checkboxFilters,
+            bookmarkedOnly: ct.showBookmarkedOnly, limit: 50000,
+            dateRangeFilters: ct.dateRangeFilters || {}, advancedFilters: ct.advancedFilters || [],
+          });
+          const dupes = values.filter((v) => v.cnt > 1);
+          setModal((p) => ({ ...p, loading: false, result: { dupes, totalValues: values.length } }));
+        };
+        return (
+          <Overlay>
+            <h3 style={ms.mh}>Find Duplicates</h3>
+            <div style={ms.fg}>
+              <label style={ms.lb}>Column</label>
+              <select value={selCol} onChange={(e) => setModal((p) => ({ ...p, selCol: e.target.value, result: null }))} style={ms.sl}>
+                {(ct.headers || []).filter((h) => !ct.hiddenColumns?.has(h)).map((h) => <option key={h} value={h}>{h}</option>)}
+              </select>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <button onClick={handleFindDuplicates} disabled={loading} style={{ ...ms.bp, opacity: loading ? 0.6 : 1 }}>
+                {loading ? "Scanning..." : "Find Duplicates"}
+              </button>
+            </div>
+            {result && (
+              <div style={{ background: th.bgAlt, border: `1px solid ${th.border}`, borderRadius: 6, padding: "10px 12px", marginBottom: 12 }}>
+                {result.dupes.length > 0 ? (<>
+                  <div style={{ fontSize: 12, color: th.text, marginBottom: 6 }}>
+                    Found <b style={{ color: th.accent }}>{result.dupes.length}</b> values with duplicates
+                    ({result.dupes.reduce((s, d) => s + d.cnt, 0)} total rows)
+                  </div>
+                  <div style={{ maxHeight: 200, overflow: "auto", fontSize: 11, fontFamily: "'SF Mono',Menlo,monospace" }}>
+                    {result.dupes.slice(0, 100).map((d, i) => (
+                      <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "2px 0", borderBottom: `1px solid ${th.border}22` }}>
+                        <span style={{ color: th.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 320 }}>{d.val || "(empty)"}</span>
+                        <span style={{ color: th.textMuted, flexShrink: 0, marginLeft: 8 }}>×{d.cnt}</span>
+                      </div>
+                    ))}
+                    {result.dupes.length > 100 && <div style={{ color: th.textMuted, padding: "4px 0", fontStyle: "italic" }}>...and {result.dupes.length - 100} more</div>}
+                  </div>
+                </>) : (
+                  <div style={{ fontSize: 12, color: th.success }}>No duplicates found — all values in this column are unique.</div>
+                )}
+              </div>
+            )}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => setModal(null)} style={ms.bs}>Cancel</button>
+              {result && result.dupes.length > 0 && (
+                <button onClick={() => {
+                  const dupeVals = result.dupes.map((d) => d.val == null || d.val === "" ? "" : String(d.val));
+                  const existing = { ...(ct.checkboxFilters || {}) };
+                  existing[selCol] = dupeVals;
+                  up("checkboxFilters", existing);
+                  setModal(null);
+                }} style={ms.bp}>Filter to Duplicates</button>
+              )}
             </div>
           </Overlay>
         );
@@ -5460,7 +5941,7 @@ export default function App() {
                     <input value={eventIdValue || ""} onChange={(e) => setModal((p) => ({ ...p, eventIdValue: e.target.value }))} placeholder="1,4688 (comma-separated, blank = all)" style={{ ...selStyle, width: 180 }} />
                     <label style={{ color: th.textDim, textAlign: "right" }}>Max processes:</label>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <input type="number" value={modal.maxRows ?? 200000} onChange={(e) => setModal((p) => ({ ...p, maxRows: Math.max(1000, parseInt(e.target.value) || 200000) }))} style={{ ...selStyle, width: 100 }} min="1000" step="50000" />
+                      <input type="number" value={modal.maxRowsInput ?? modal.maxRows ?? 200000} onChange={(e) => setModal((p) => ({ ...p, maxRowsInput: e.target.value }))} onBlur={(e) => { const v = parseInt(e.target.value); setModal((p) => ({ ...p, maxRows: isNaN(v) || v < 100 ? 200000 : v, maxRowsInput: undefined })); }} style={{ ...selStyle, width: 100 }} min="100" step="50000" />
                       <span style={{ fontSize: 10, color: th.textMuted }}>default: 200,000</span>
                     </div>
                   </div>
@@ -6395,6 +6876,19 @@ export default function App() {
           { cat: "Session Lifecycle", name: "Account Logoff", sev: "low", eids: ["4634", "4647"], hint: "Logoff / user-initiated logoff" },
         ];
         const LM_SEV_COLORS = { critical: "#f85149", high: "#f0883e", medium: "#d29922", low: "#8b949e" };
+        const MITRE_MAP = {
+          "T1110.001": { name: "Brute Force: Password Guessing", url: "https://attack.mitre.org/techniques/T1110/001/" },
+          "T1110.003": { name: "Brute Force: Password Spraying", url: "https://attack.mitre.org/techniques/T1110/003/" },
+          "T1078": { name: "Valid Accounts", url: "https://attack.mitre.org/techniques/T1078/" },
+          "T1021": { name: "Remote Services", url: "https://attack.mitre.org/techniques/T1021/" },
+          "T1569.002": { name: "System Services: Service Execution", url: "https://attack.mitre.org/techniques/T1569/002/" },
+          "T1219": { name: "Remote Access Software", url: "https://attack.mitre.org/techniques/T1219/" },
+        };
+        const MitreBadge = ({ id }) => {
+          const m = MITRE_MAP[id];
+          if (!m) return null;
+          return <span onClick={(e) => { e.stopPropagation(); window.open(m.url, "_blank"); }} title={m.name} style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "1px 6px", background: "#58a6ff18", color: "#58a6ff", border: "1px solid #58a6ff33", borderRadius: 4, fontSize: 9, fontFamily: "monospace", cursor: "pointer", fontWeight: 600, letterSpacing: "0.02em", transition: "all 0.15s" }} onMouseEnter={(e) => { e.currentTarget.style.background = "#58a6ff30"; }} onMouseLeave={(e) => { e.currentTarget.style.background = "#58a6ff18"; }}>{id}</span>;
+        };
         const lmDisabledSet = modal.lmDisabledRules || new Set();
         const lmActiveCount = LM_RULES.length - [...lmDisabledSet].filter((k) => k.startsWith("lm-")).length;
         const lmCustomCount = (modal.lmCustomRules || []).length;
@@ -6443,7 +6937,7 @@ export default function App() {
               const layoutIds = new Set(layoutNodes.map((n) => n.id));
               const layoutEdges = result.edges.filter((e) => layoutIds.has(e.source) && layoutIds.has(e.target));
               const pos = computeForceLayout(layoutNodes, layoutEdges);
-              setModal((p) => p?.type === "lateralMovement" && !p._cancelled ? { ...p, phase: "results", loading: false, data: result, positions: pos, selectedNode: null, selectedEdge: null, viewTab: "graph", truncatedGraph: result.nodes.length > 500 } : p);
+              setModal((p) => p?.type === "lateralMovement" && !p._cancelled ? { ...p, phase: "results", loading: false, data: result, positions: pos, selectedNode: null, selectedEdge: null, viewTab: "graph", truncatedGraph: result.nodes.length > 500, rdpViewMode: "grouped" } : p);
             }
           } catch (e) {
             clearInterval(pInt);
@@ -6703,30 +7197,34 @@ export default function App() {
                     {/* Stats cards — glass morphism */}
                     <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
                       {[
+                        { val: data.stats.findingsCount || 0, label: "findings", color: (data.stats.criticalFindings || 0) > 0 ? "#f85149" : "#f0883e", icon: "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01", clickTab: "findings" },
                         { val: data.stats.uniqueHosts, label: "unique hosts", color: th.accent, icon: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" },
                         { val: data.stats.uniqueConnections, label: "connections", color: "#58a6ff", icon: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" },
                         { val: data.stats.uniqueUsers, label: "users", color: "#d2a8ff", icon: "M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8" },
                         { val: data.stats.rdpSessionCount || 0, label: "rdp sessions", color: "#58a6ff", icon: "M2 3h20v14H2zM8 21h8M12 17v4" },
                         { val: data.stats.longestChain, label: "longest chain", color: "#d29922", icon: "M13 17l5-5-5-5M6 17l5-5-5-5" },
-                        { val: data.nodes.filter(n => n.isOutlier).length, label: "outliers", color: th.danger || "#f85149", icon: "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01" },
+                        { val: data.nodes.filter(n => n.isOutlier).length, label: "outliers", color: th.danger || "#f85149", icon: "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01", clickTab: "outlier" },
                         { val: data.stats.totalEvents?.toLocaleString(), label: "logon events", color: "#3fb950", icon: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8" },
                       ].map((c, i) => {
-                        const isOutlierCard = c.label === "outliers" && Number(c.val) > 0;
-                        return (
-                        <div key={i} onClick={isOutlierCard ? () => {
-                          // Switch to graph view and zoom to first outlier
-                          const outlierNode = data.nodes.find(n => n.isOutlier);
-                          if (outlierNode && positions && positions[outlierNode.id]) {
-                            const p = positions[outlierNode.id];
-                            setModal((prev) => ({ ...prev, viewTab: "graph", selectedNode: outlierNode.id, selectedEdge: null, viewBox: { x: p.x - 90, y: p.y - 60, w: 180, h: 120 }, lmFlagIdx: 1 }));
+                        const isClickable = (c.clickTab === "findings" && Number(c.val) > 0) || (c.clickTab === "outlier" && Number(c.val) > 0);
+                        const handleClick = () => {
+                          if (c.clickTab === "findings") { setModal((p) => ({ ...p, viewTab: "findings" })); return; }
+                          if (c.clickTab === "outlier") {
+                            const outlierNode = data.nodes.find(n => n.isOutlier);
+                            if (outlierNode && positions && positions[outlierNode.id]) {
+                              const p = positions[outlierNode.id];
+                              setModal((prev) => ({ ...prev, viewTab: "graph", selectedNode: outlierNode.id, selectedEdge: null, viewBox: { x: p.x - 90, y: p.y - 60, w: 180, h: 120 }, lmFlagIdx: 1 }));
+                            }
                           }
-                        } : undefined} style={{ flex: 1, textAlign: "center", padding: "10px 6px 8px", background: `linear-gradient(160deg, ${c.color}08, ${c.color}03)`, borderRadius: 10, border: `1px solid ${c.color}20`, position: "relative", overflow: "hidden", cursor: isOutlierCard ? "pointer" : "default", transition: "border-color 0.15s" }}
-                          onMouseEnter={isOutlierCard ? (e) => e.currentTarget.style.borderColor = c.color + "60" : undefined}
-                          onMouseLeave={isOutlierCard ? (e) => e.currentTarget.style.borderColor = c.color + "20" : undefined}>
+                        };
+                        return (
+                        <div key={i} onClick={isClickable ? handleClick : undefined} style={{ flex: 1, textAlign: "center", padding: "10px 6px 8px", background: `linear-gradient(160deg, ${c.color}08, ${c.color}03)`, borderRadius: 10, border: `1px solid ${c.color}20`, position: "relative", overflow: "hidden", cursor: isClickable ? "pointer" : "default", transition: "border-color 0.15s" }}
+                          onMouseEnter={isClickable ? (e) => e.currentTarget.style.borderColor = c.color + "60" : undefined}
+                          onMouseLeave={isClickable ? (e) => e.currentTarget.style.borderColor = c.color + "20" : undefined}>
                           <div style={{ position: "absolute", top: -8, right: -8, width: 40, height: 40, borderRadius: 20, background: `radial-gradient(circle, ${c.color}12, transparent)` }} />
                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={c.color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.5, marginBottom: 2 }}><path d={c.icon}/></svg>
                           <div style={{ fontSize: 22, fontWeight: 700, color: c.color, fontFamily: "-apple-system, sans-serif", letterSpacing: "-0.5px", lineHeight: 1 }}>{c.val}</div>
-                          <div style={{ fontSize: 9, color: th.textMuted, marginTop: 3, fontFamily: "-apple-system, sans-serif", textTransform: "uppercase", letterSpacing: "0.05em", fontWeight: 500 }}>{c.label}{isOutlierCard && " ▸"}</div>
+                          <div style={{ fontSize: 9, color: th.textMuted, marginTop: 3, fontFamily: "-apple-system, sans-serif", textTransform: "uppercase", letterSpacing: "0.05em", fontWeight: 500 }}>{c.label}{isClickable && " \u25b8"}</div>
                         </div>
                         );
                       })}
@@ -6741,6 +7239,7 @@ export default function App() {
                         { id: "rdp", label: `RDP Sessions (${data.rdpSessions?.length || 0})`, icon: "M2 3h20v14H2zM8 21h8M12 17v4" },
                         { id: "chains", label: `Chains (${data.chains.length})`, icon: "M13 17l5-5-5-5M6 17l5-5-5-5" },
                         { id: "table", label: `Connections (${data.edges.length})`, icon: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18M15 3v18" },
+                        ...((data.findings || []).length > 0 ? [{ id: "findings", label: `Findings (${data.findings.length})`, icon: "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01" }] : []),
                       ].map((tab) => (
                         <button key={tab.id} onClick={() => setModal((p) => ({ ...p, viewTab: tab.id, selectedNode: null, selectedEdge: null }))}
                           style={{ padding: "5px 12px", background: viewTab === tab.id ? `linear-gradient(180deg, ${th.accent}ee, ${th.accent})` : "transparent", color: viewTab === tab.id ? "#fff" : th.textDim, border: "none", borderRadius: 6, fontSize: 11, cursor: "pointer", fontFamily: "-apple-system, sans-serif", fontWeight: viewTab === tab.id ? 600 : 400, transition: "all 0.15s", display: "flex", alignItems: "center", gap: 5, boxShadow: viewTab === tab.id ? `0 1px 4px ${th.accent}44` : "none" }}
@@ -6751,6 +7250,95 @@ export default function App() {
                         </button>
                       ))}
                     </div>
+
+                    {/* Findings tab */}
+                    {viewTab === "findings" && (() => {
+                      const findings = data.findings || [];
+                      const sevCounts = { critical: 0, high: 0, medium: 0, low: 0 };
+                      findings.forEach((f) => { if (sevCounts[f.severity] !== undefined) sevCounts[f.severity]++; });
+                      return (
+                        <div>
+                          {/* Severity summary bar */}
+                          <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                            {Object.entries(sevCounts).filter(([, v]) => v > 0).map(([sev, cnt]) => (
+                              <span key={sev} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 10px", background: LM_SEV_COLORS[sev] + "18", color: LM_SEV_COLORS[sev], border: `1px solid ${LM_SEV_COLORS[sev]}33`, borderRadius: 6, fontSize: 10, fontWeight: 600, fontFamily: "-apple-system, sans-serif", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                                {cnt} {sev}
+                              </span>
+                            ))}
+                          </div>
+                          {/* Findings list */}
+                          <div style={{ maxHeight: lmH - 230, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+                            {findings.map((f) => (
+                              <div key={f.id} style={{ padding: "10px 14px", background: `${LM_SEV_COLORS[f.severity]}06`, border: `1px solid ${LM_SEV_COLORS[f.severity]}25`, borderRadius: 8, transition: "border-color 0.15s" }}
+                                onMouseEnter={(e) => e.currentTarget.style.borderColor = LM_SEV_COLORS[f.severity] + "55"}
+                                onMouseLeave={(e) => e.currentTarget.style.borderColor = LM_SEV_COLORS[f.severity] + "25"}>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                                  <span style={{ padding: "1px 7px", background: LM_SEV_COLORS[f.severity] + "22", color: LM_SEV_COLORS[f.severity], borderRadius: 4, fontSize: 9, fontWeight: 700, textTransform: "uppercase", fontFamily: "-apple-system, sans-serif", letterSpacing: "0.04em" }}>{f.severity}</span>
+                                  <MitreBadge id={f.mitre} />
+                                  <span style={{ fontSize: 12, fontWeight: 600, color: th.text, fontFamily: "-apple-system, sans-serif", flex: 1 }}>{f.title}</span>
+                                </div>
+                                <div style={{ fontSize: 11, color: th.textDim, fontFamily: "-apple-system, sans-serif", marginBottom: 6, lineHeight: 1.4 }}>{f.description}</div>
+                                <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                                  <span style={{ fontSize: 10, color: th.textMuted, fontFamily: "monospace" }}>
+                                    {f.source}{f.target && f.target !== f.source ? ` \u2192 ${f.target}` : ""}
+                                  </span>
+                                  {f.timeRange?.from && <span style={{ fontSize: 9, color: th.textMuted, fontFamily: "monospace" }}>{(f.timeRange.from || "").slice(0, 19)}{f.timeRange.to && f.timeRange.to !== f.timeRange.from ? ` \u2014 ${f.timeRange.to.slice(0, 19)}` : ""}</span>}
+                                  <span style={{ fontSize: 9, color: th.textMuted }}>{f.eventCount} event{f.eventCount !== 1 ? "s" : ""}</span>
+                                  <div style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
+                                    <button onClick={() => {
+                                      // Close modal, apply targeted filters for this finding's raw events
+                                      const lmCols = data.columns || {};
+                                      const categoryEids = { "Brute Force": ["4625"], "Password Spray": ["4625"], "Credential Compromise": ["4624", "4625"], "Impacket Execution": ["4624", "4672", "4634"], "Lateral Pivot": ["4624", "4625", "4648", "4672", "21", "25", "1149"], "First Seen": ["4624", "4625", "4648", "21", "25", "1149"] };
+                                      const eids = f.filterEids || categoryEids[f.category];
+                                      // 1) EventId checkbox filter — only show the relevant event types
+                                      if (eids && lmCols.eventId) {
+                                        up("checkboxFilters", { ...(ct?.checkboxFilters || {}), [lmCols.eventId]: eids });
+                                      }
+                                      // 2) Date range — use raw timestamps directly (no timezone conversion)
+                                      //    Finding timestamps come from row.ts which IS the raw column value,
+                                      //    so pass them straight through with simple string-based ±5min padding
+                                      if (lmCols.ts && f.timeRange?.from) {
+                                        const rawFrom = f.timeRange.from;
+                                        const rawTo = f.timeRange.to || rawFrom;
+                                        // Parse as local time (same as how DB stores it), pad, reformat in same format
+                                        const sep = rawFrom.includes("T") ? "T" : " ";
+                                        const padTs = (s, deltaMs) => {
+                                          // Parse without timezone suffix — treat as local/naive
+                                          const d = new Date(s.replace("T", " ").replace("Z", ""));
+                                          if (isNaN(d)) return s;
+                                          const nd = new Date(d.getTime() + deltaMs);
+                                          const p = (n) => String(n).padStart(2, "0");
+                                          return `${nd.getFullYear()}-${p(nd.getMonth()+1)}-${p(nd.getDate())}${sep}${p(nd.getHours())}:${p(nd.getMinutes())}:${p(nd.getSeconds())}`;
+                                        };
+                                        up("dateRangeFilters", { [lmCols.ts]: { from: padTs(rawFrom, -300000), to: padTs(rawTo, 300000) } });
+                                      }
+                                      // 3) Clear search & column filters to avoid interference
+                                      up("searchTerm", "");
+                                      up("columnFilters", {});
+                                      setModal(null);
+                                    }} style={{ padding: "2px 8px", background: `${th.accent}15`, color: th.accent, border: `1px solid ${th.accent}33`, borderRadius: 4, fontSize: 9, cursor: "pointer", fontFamily: "-apple-system, sans-serif", fontWeight: 500 }}>Filter Events</button>
+                                    <button onClick={() => {
+                                      const edge = data.edges.find((e) => e.source === f.source && e.target === f.target);
+                                      if (edge && positions) {
+                                        const sp = positions[f.source], tp = positions[f.target];
+                                        if (sp && tp) {
+                                          const cx = (sp.x + tp.x) / 2, cy = (sp.y + tp.y) / 2;
+                                          setModal((p) => ({ ...p, viewTab: "graph", selectedEdge: edge, selectedNode: null, viewBox: { x: cx - 120, y: cy - 80, w: 240, h: 160 } }));
+                                        } else {
+                                          setModal((p) => ({ ...p, viewTab: "graph", selectedEdge: edge, selectedNode: null }));
+                                        }
+                                      } else {
+                                        setModal((p) => ({ ...p, viewTab: "graph" }));
+                                      }
+                                    }} style={{ padding: "2px 8px", background: `${th.accent}15`, color: th.accent, border: `1px solid ${th.accent}33`, borderRadius: 4, fontSize: 9, cursor: "pointer", fontFamily: "-apple-system, sans-serif", fontWeight: 500 }}>View in Graph</button>
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {/* Graph tab */}
                     {viewTab === "graph" && (() => {
@@ -7372,6 +7960,10 @@ export default function App() {
                       const rdpTotalTableW = 30 + rdpHeaders.reduce((acc, h) => acc + (rdpColWidths[h] || rdpDefWidths[h]), 0);
                       const expandedIdx = modal.expandedSession;
 
+                      const rdpViewMode = modal.rdpViewMode || "grouped";
+                      const gSessions = data.groupedSessions || [];
+                      const expandedGroup = modal.expandedGroup;
+
                       return (
                         <div>
                           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, marginBottom: 6 }}>
@@ -7382,13 +7974,66 @@ export default function App() {
                                 <button onClick={() => setModal((p) => ({ ...p, rdpColFilters: {} }))} style={{ padding: "1px 8px", fontSize: 9, background: th.accent, color: "#fff", border: "none", borderRadius: 4, cursor: "pointer", fontWeight: 600 }}>Clear All</button>
                               </div>
                             )}
-                            <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
+                            <div style={{ display: "flex", gap: 6, marginLeft: "auto", alignItems: "center" }}>
+                              {/* Grouped/Individual toggle */}
+                              {gSessions.length > 0 && (
+                                <div style={{ display: "inline-flex", background: th.panelBg, borderRadius: 6, padding: 2, border: `1px solid ${th.border}44`, gap: 1 }}>
+                                  {[{ id: "grouped", label: "Grouped" }, { id: "individual", label: "Individual" }].map((m) => (
+                                    <button key={m.id} onClick={() => setModal((p) => ({ ...p, rdpViewMode: m.id }))} style={{ padding: "2px 10px", background: rdpViewMode === m.id ? `${th.accent}` : "transparent", color: rdpViewMode === m.id ? "#fff" : th.textDim, border: "none", borderRadius: 4, fontSize: 9, cursor: "pointer", fontFamily: "-apple-system, sans-serif", fontWeight: rdpViewMode === m.id ? 600 : 400, transition: "all 0.15s" }}>{m.label}</button>
+                                  ))}
+                                </div>
+                              )}
                               <button onClick={copyRdp} style={{ padding: "3px 10px", fontSize: 10, background: th.btnBg, color: th.text, border: `1px solid ${th.border}`, borderRadius: 4, cursor: "pointer", fontFamily: "-apple-system, sans-serif" }}
                                 onMouseEnter={(ev) => { ev.currentTarget.style.background = th.accent + "22"; }} onMouseLeave={(ev) => { ev.currentTarget.style.background = th.btnBg; }}>
                                 {rdpCheckedCount > 0 ? `Copy Selected (${rdpCheckedCount})` : `Copy All (${sortedSessions.length})`}
                               </button>
                             </div>
                           </div>
+
+                          {/* Grouped view */}
+                          {rdpViewMode === "grouped" && gSessions.length > 0 ? (
+                            <div style={{ maxHeight: 400, overflowY: "auto", border: `1px solid ${th.border}`, borderRadius: 6 }}>
+                              {gSessions.map((g, gi) => {
+                                const ss = statusStyle(g.status);
+                                const isExpanded = expandedGroup === gi;
+                                return (
+                                  <div key={gi}>
+                                    <div onClick={() => setModal((p) => ({ ...p, expandedGroup: p.expandedGroup === gi ? null : gi }))} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", background: isExpanded ? `${th.accent}08` : "transparent", borderBottom: `1px solid ${th.border}33`, cursor: "pointer", transition: "background 0.1s" }}
+                                      onMouseEnter={(e) => { if (!isExpanded) e.currentTarget.style.background = th.textMuted + "08"; }}
+                                      onMouseLeave={(e) => { if (!isExpanded) e.currentTarget.style.background = "transparent"; }}>
+                                      <span style={{ fontSize: 8, color: th.textMuted, width: 12, flexShrink: 0 }}>{isExpanded ? "\u25BC" : "\u25B6"}</span>
+                                      <span style={{ padding: "1px 6px", background: ss.bg, color: ss.color, borderRadius: 3, fontSize: 8, fontWeight: 700, fontFamily: "-apple-system, sans-serif", flexShrink: 0 }}>{ss.label}</span>
+                                      <span style={{ fontSize: 10, fontFamily: "monospace", color: th.text }}>{g.source || "\u2014"}</span>
+                                      <span style={{ fontSize: 10, color: th.textMuted }}>{"\u2192"}</span>
+                                      <span style={{ fontSize: 10, fontFamily: "monospace", color: th.text }}>{g.target || "\u2014"}</span>
+                                      <span style={{ fontSize: 10, color: th.textDim, fontFamily: "-apple-system, sans-serif" }}>{g.user || "(unknown)"}</span>
+                                      <span style={{ padding: "1px 6px", background: g.count > 5 ? "#f0883e22" : `${th.accent}11`, color: g.count > 5 ? "#f0883e" : th.accent, borderRadius: 4, fontSize: 9, fontWeight: 600, fontFamily: "-apple-system, sans-serif", flexShrink: 0 }}>{g.count} session{g.count !== 1 ? "s" : ""}</span>
+                                      <span style={{ fontSize: 9, color: th.textMuted, fontFamily: "monospace", marginLeft: "auto" }}>{(g.timeRange.from || "").slice(0, 19)}{g.timeRange.to && g.timeRange.to !== g.timeRange.from ? ` \u2014 ${(g.timeRange.to || "").slice(0, 19)}` : ""}</span>
+                                    </div>
+                                    {isExpanded && (
+                                      <div style={{ padding: "4px 12px 8px 32px", background: `${th.accent}04`, borderBottom: `1px solid ${th.border}33` }}>
+                                        {g.sessions.map((s, si) => {
+                                          const sts = statusStyle(s.status);
+                                          return (
+                                            <div key={si} style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 0", fontSize: 9, fontFamily: "monospace", color: th.textDim, borderBottom: si < g.sessions.length - 1 ? `1px solid ${th.border}15` : "none" }}>
+                                              <span style={{ padding: "0 4px", background: sts.bg, color: sts.color, borderRadius: 2, fontSize: 8, fontWeight: 600 }}>{sts.label}</span>
+                                              <span>{s.source}</span><span style={{ color: th.textMuted }}>{"\u2192"}</span><span>{s.target}</span>
+                                              <span style={{ color: th.textMuted }}>{s.user || "(unknown)"}</span>
+                                              <span style={{ color: th.textMuted }}>SID:{s.sessionId ?? "\u2014"}</span>
+                                              <span style={{ color: th.textMuted }}>{(s.startTime || "").slice(0, 19)}</span>
+                                              {s.endTime && <span style={{ color: th.textMuted }}>{"\u2014"} {s.endTime.slice(0, 19)}</span>}
+                                              <span style={{ color: th.textMuted }}>{fmtDur(s.startTime, s.endTime)}</span>
+                                              {s.hasAdmin && <span style={{ padding: "0 3px", background: "#f8514922", color: "#f85149", borderRadius: 2, fontSize: 7, fontWeight: 700 }}>ADMIN</span>}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
                           <div style={{ maxHeight: 400, overflow: "auto", border: `1px solid ${th.border}`, borderRadius: 6 }}>
                             <table style={{ borderCollapse: "collapse", fontSize: 10, fontFamily: "monospace", tableLayout: "fixed", width: rdpTotalTableW }}>
                               <thead>
@@ -7467,6 +8112,7 @@ export default function App() {
                               </tbody>
                             </table>
                           </div>
+                          )}
                           {/* RDP Column filter dropdown popup */}
                           {rdpFilterOpen && (
                             <>

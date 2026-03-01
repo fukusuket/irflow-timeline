@@ -42,6 +42,12 @@ process.on("exit", _flushLog);
 class TimelineDB {
   constructor() {
     this.databases = new Map(); // tabId -> { db, dbPath, headers, rowCount, tsColumns }
+    // Periodic WAL checkpoint — prevent unbounded WAL growth on long sessions
+    this._walInterval = setInterval(() => {
+      for (const [, meta] of this.databases) {
+        try { if (meta.db?.open) meta.db.pragma("wal_checkpoint(PASSIVE)"); } catch {}
+      }
+    }, 5 * 60 * 1000); // every 5 minutes
   }
 
   /**
@@ -251,6 +257,7 @@ class TimelineDB {
     // Create tags table
     db.exec(`CREATE TABLE tags (rowid INTEGER, tag TEXT, PRIMARY KEY(rowid, tag))`);
     db.exec(`CREATE INDEX idx_tags_tag ON tags(tag)`);
+    db.exec(`CREATE INDEX idx_tags_rowid ON tags(rowid)`);
 
     // Create color rules table
     db.exec(
@@ -840,12 +847,17 @@ class TimelineDB {
     for (let i = 0; i < rowIds.length; i += BATCH) {
       const batch = rowIds.slice(i, i + BATCH);
       const placeholders = batch.map(() => "?").join(",");
-      const bm = db.prepare(`SELECT rowid FROM bookmarks WHERE rowid IN (${placeholders})`).all(...batch);
-      for (const b of bm) bookmarkedSet.add(b.rowid);
-      const tags = db.prepare(`SELECT rowid, tag FROM tags WHERE rowid IN (${placeholders})`).all(...batch);
-      for (const t of tags) {
-        if (!rowTags[t.rowid]) rowTags[t.rowid] = [];
-        rowTags[t.rowid].push(t.tag);
+      try {
+        const combined = db.prepare(
+          `SELECT rowid, 'b' as t, '' as tag FROM bookmarks WHERE rowid IN (${placeholders})` +
+          ` UNION ALL SELECT rowid, 't', tag FROM tags WHERE rowid IN (${placeholders})`
+        ).all(...batch, ...batch);
+        for (const r of combined) {
+          if (r.t === "b") bookmarkedSet.add(r.rowid);
+          else { if (!rowTags[r.rowid]) rowTags[r.rowid] = []; rowTags[r.rowid].push(r.tag); }
+        }
+      } catch (e) {
+        // Fail gracefully — return rows without bookmark/tag decoration
       }
     }
 
@@ -2950,7 +2962,7 @@ class TimelineDB {
         if (clientAddress && clientAddress !== "LOCAL") edge.clientAddresses.add(clientAddress);
         if (eventId) edge.eventBreakdown.set(eventId, (edge.eventBreakdown.get(eventId) || 0) + 1);
 
-        timeOrdered.push({ source: sourceHost, target: targetHost, user, ts, logonType });
+        timeOrdered.push({ source: sourceHost, target: targetHost, user, ts, logonType, eventId });
       }
 
       // === RDP Session Correlation ===
@@ -3063,6 +3075,25 @@ class TimelineDB {
         }
       }
 
+      // === Session Grouping ===
+      const sortedForGrouping = [...rdpSessions].sort((a, b) => (a.startTime || "").localeCompare(b.startTime || ""));
+      const groupedSessions = [];
+      let curGroup = null;
+      for (const s of sortedForGrouping) {
+        const gk = `${s.source}|${s.target}|${s.user}|${s.status}`;
+        if (curGroup && curGroup._k === gk) {
+          curGroup.sessions.push(s);
+          curGroup.count++;
+          if (s.startTime && s.startTime < curGroup.timeRange.from) curGroup.timeRange.from = s.startTime;
+          const et = s.endTime || s.startTime;
+          if (et && et > curGroup.timeRange.to) curGroup.timeRange.to = et;
+        } else {
+          if (curGroup) { delete curGroup._k; groupedSessions.push(curGroup); }
+          curGroup = { _k: gk, sessions: [s], count: 1, status: s.status, source: s.source, target: s.target, user: s.user, timeRange: { from: s.startTime || "", to: s.endTime || s.startTime || "" }, representativeSession: s };
+        }
+      }
+      if (curGroup) { delete curGroup._k; groupedSessions.push(curGroup); }
+
       // Chain detection: time-ordered DFS for multi-hop paths
       const adjByTime = new Map();
       for (const evt of timeOrdered) {
@@ -3105,6 +3136,299 @@ class TimelineDB {
       }
       chains.sort((a, b) => b.hops - a.hops);
 
+      // === First-seen Flags ===
+      let globalMinTs = null, globalMaxTs = null;
+      for (const edge of edgeMap.values()) {
+        if (edge.firstSeen) {
+          if (!globalMinTs || edge.firstSeen < globalMinTs) globalMinTs = edge.firstSeen;
+          if (!globalMaxTs || edge.lastSeen > globalMaxTs) globalMaxTs = edge.lastSeen;
+        }
+      }
+      const totalRangeMs = globalMinTs && globalMaxTs ? (new Date(globalMaxTs) - new Date(globalMinTs)) : 0;
+      const firstSeenThresholdTs = totalRangeMs > 0 ? new Date(new Date(globalMinTs).getTime() + totalRangeMs * 0.01).toISOString() : null;
+      const firstConnPerSource = new Map();
+      for (const edge of edgeMap.values()) {
+        const ex = firstConnPerSource.get(edge.source);
+        if (!ex || edge.firstSeen < ex) firstConnPerSource.set(edge.source, edge.firstSeen);
+      }
+      for (const edge of edgeMap.values()) {
+        edge.isFirstSeen = (firstSeenThresholdTs && edge.firstSeen <= firstSeenThresholdTs) || firstConnPerSource.get(edge.source) === edge.firstSeen;
+      }
+
+      // === Attack Pattern Detection ===
+      const findings = [];
+      let fid = 0;
+
+      // Brute Force (T1110.001): 5+ failed logons same src->tgt within 5 min
+      const failedByPair = new Map();
+      for (const evt of timeOrdered) {
+        if (evt.eventId !== "4625") continue;
+        const k = `${evt.source}->${evt.target}`;
+        if (!failedByPair.has(k)) failedByPair.set(k, []);
+        failedByPair.get(k).push(evt.ts);
+      }
+      for (const [k, tss] of failedByPair) {
+        if (tss.length < 5) continue;
+        tss.sort();
+        for (let i = 0; i <= tss.length - 5; i++) {
+          const ws = new Date(tss[i]), we = new Date(tss[i + 4]);
+          if (isNaN(ws) || isNaN(we)) continue;
+          if ((we - ws) <= 300000) {
+            let end = i + 4;
+            while (end + 1 < tss.length && (new Date(tss[end + 1]) - ws) <= 300000) end++;
+            const [src, tgt] = k.split("->");
+            findings.push({ id: fid++, severity: "high", category: "Brute Force", mitre: "T1110.001", title: `Brute force: ${src} \u2192 ${tgt}`, description: `${end - i + 1} failed logons within 5 minutes`, source: src, target: tgt, timeRange: { from: tss[i], to: tss[end] }, eventCount: end - i + 1 });
+            break;
+          }
+        }
+      }
+
+      // Password Spray (T1110.003): same source fails against 3+ targets within 30 min
+      const failedBySrc = new Map();
+      for (const evt of timeOrdered) {
+        if (evt.eventId !== "4625") continue;
+        if (!failedBySrc.has(evt.source)) failedBySrc.set(evt.source, []);
+        failedBySrc.get(evt.source).push({ target: evt.target, ts: evt.ts });
+      }
+      for (const [src, evts] of failedBySrc) {
+        if (evts.length < 3) continue;
+        evts.sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+        for (let i = 0; i < evts.length; i++) {
+          const ws = new Date(evts[i].ts);
+          if (isNaN(ws)) continue;
+          const we = new Date(ws.getTime() + 1800000);
+          const tgts = new Set();
+          let j = i;
+          while (j < evts.length) { const t = new Date(evts[j].ts); if (isNaN(t) || t > we) break; tgts.add(evts[j].target); j++; }
+          if (tgts.size >= 3) {
+            findings.push({ id: fid++, severity: "high", category: "Password Spray", mitre: "T1110.003", title: `Password spray from ${src}`, description: `${src} failed logon to ${tgts.size} different targets within 30 minutes`, source: src, target: [...tgts].join(", "), timeRange: { from: evts[i].ts, to: evts[j - 1].ts }, eventCount: j - i });
+            break;
+          }
+        }
+      }
+
+      // Credential Compromise (T1078): failed then success within 10 min same src->tgt
+      const evtsByPair = new Map();
+      for (const evt of timeOrdered) {
+        if (evt.eventId !== "4625" && evt.eventId !== "4624") continue;
+        const k = `${evt.source}->${evt.target}`;
+        if (!evtsByPair.has(k)) evtsByPair.set(k, []);
+        evtsByPair.get(k).push({ eventId: evt.eventId, ts: evt.ts, user: evt.user });
+      }
+      for (const [k, evts] of evtsByPair) {
+        evts.sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+        let found = false;
+        for (let i = 0; i < evts.length && !found; i++) {
+          if (evts[i].eventId !== "4625") continue;
+          const ft = new Date(evts[i].ts);
+          if (isNaN(ft)) continue;
+          for (let j = i + 1; j < evts.length; j++) {
+            if (evts[j].eventId !== "4624") continue;
+            const st = new Date(evts[j].ts);
+            if (isNaN(st)) continue;
+            const diff = st - ft;
+            if (diff > 600000) break;
+            if (diff >= 0) {
+              const [src, tgt] = k.split("->");
+              findings.push({ id: fid++, severity: "critical", category: "Credential Compromise", mitre: "T1078", title: `Credential compromise: ${src} \u2192 ${tgt}`, description: `Failed logon followed by success within ${Math.round(diff / 1000)}s. User: ${evts[j].user || "(unknown)"}`, source: src, target: tgt, timeRange: { from: evts[i].ts, to: evts[j].ts }, eventCount: 2 });
+              found = true; break;
+            }
+          }
+        }
+      }
+
+      // === Impacket (T1569.002) + RMM Tool (T1219) — single combined query ===
+      // One SQL query targeting process creation (4688/1), service install (7045/4697),
+      // and scheduled task (4698) channels. One JS loop checks both Impacket patterns and RMM keywords.
+      const _scanEidCol = columns.eventId ? meta.colMap[columns.eventId] : null;
+      const _scanTsCol = columns.ts ? meta.colMap[columns.ts] : null;
+      const _scanChanCol = columns._channel ? meta.colMap[columns._channel] : null;
+      const _scanDetect = (pats) => { for (const p of pats) { const f = meta.headers.find(h => p.test(h)); if (f) return meta.colMap[f]; } return null; };
+      const _scanCols = [
+        _scanDetect([/^CommandLine$/i, /^command_line$/i, /^ProcessCommandLine$/i, /^cmdline$/i]),
+        _scanDetect([/^Image$/i, /^NewProcessName$/i, /^process_name$/i, /^FileName$/i, /^ImagePath$/i]),
+        _scanDetect([/^ParentImage$/i, /^ParentProcessName$/i, /^ParentCommandLine$/i]),
+        _scanDetect([/^ExecutableInfo$/i]),
+        _scanDetect([/^ServiceName$/i]),
+        _scanDetect([/^MapDescription$/i]),
+        ...[1,2,3,4,5,6].map(n => { const h = meta.headers.find(h => new RegExp(`^PayloadData${n}$`, "i").test(h)); return h ? meta.colMap[h] : null; }),
+      ].filter(Boolean);
+      const RMM_SIGS = [
+        { name: "ConnectWise ScreenConnect", kw: ["screenconnect"] },
+        { name: "AnyDesk", kw: ["anydesk"] },
+        { name: "TeamViewer", kw: ["teamviewer"] },
+        { name: "Atera", kw: ["ateraagent", "alphaagent.exe"] },
+        { name: "NetSupport Manager", kw: ["client32.exe", "netsupport manager"] },
+        { name: "Splashtop", kw: ["splashtop", "strwinclt.exe", "srservice.exe"] },
+        { name: "RustDesk", kw: ["rustdesk"] },
+        { name: "PDQ Connect", kw: ["pdq connect", "pdqconnect"] },
+        { name: "MeshAgent/MeshCentral", kw: ["meshagent", "meshcentral"] },
+        { name: "Action1", kw: ["action1_connector", "action1_agent"] },
+        { name: "Ammyy Admin", kw: ["ammyy"] },
+        { name: "Remote Utilities", kw: ["rutview.exe", "rutserv.exe", "remote utilities"] },
+        { name: "SimpleHelp", kw: ["simplehelp"] },
+        { name: "TacticalRMM", kw: ["tacticalrmm"] },
+        { name: "FleetDeck", kw: ["fleetdeck"] },
+        { name: "Level.io", kw: ["level-windows-amd64"] },
+        { name: "DWService", kw: ["dwagsvc.exe", "dwagent.exe", "dwservice"] },
+        { name: "ngrok", kw: ["ngrok"] },
+        { name: "ISL Online", kw: ["isllight", "isl online"] },
+        { name: "HopToDesk", kw: ["hoptodesk"] },
+        { name: "Lite Manager", kw: ["litemanager", "lmnoipserver"] },
+        { name: "UltraVNC", kw: ["ultravnc", "uvnc_launch", "winvnc.exe"] },
+        { name: "TigerVNC", kw: ["tigervnc", "tvnserver.exe"] },
+        { name: "RAdmin", kw: ["rserver3.exe", "radmin.exe"] },
+        { name: "Zoho Assist", kw: ["zaservice.exe", "zoho assist"] },
+        { name: "Pulseway", kw: ["pcmonitormanager", "pulseway"] },
+        { name: "LabTech/Automate", kw: ["ltsvc.exe", "ltsvcmon.exe", "labtech", "connectwise automate"] },
+        { name: "Tailscale", kw: ["tailscale"] },
+        { name: "Kaseya VSA", kw: ["agentmon.exe", "kaseya"] },
+        { name: "N-able/SolarWinds", kw: ["n-able", "solarwinds.msp"] },
+      ];
+      const _rmmFlatKw = [];
+      const _rmmKwToTool = new Map();
+      for (const tool of RMM_SIGS) {
+        for (const kw of tool.kw) { _rmmFlatKw.push(kw.toLowerCase()); _rmmKwToTool.set(kw.toLowerCase(), tool); }
+      }
+      const COMMON_SVC = new Set(["system","service","server","client","agent","local","admin","power","event","setup","shell","start","print","audit","group","share","trust","alert","cache","debug","error","index","input","media","model","panel","patch","proxy","query","queue","route","scene","scope","stack","stage","state","store","style","super","table","theme","timer","token","trace","track","train","trend","union","unity","usage","valid","watch"]);
+      if (_scanEidCol && _scanCols.length > 0) {
+        try {
+          const _scanTargetEids = ["4688", "1", "7045", "4697", "4698"];
+          const _scanConcat = _scanCols.map(c => `COALESCE(${c}, '')`).join(" || '|' || ");
+          const _scanSelParts = [`(${_scanConcat}) as _alltext`, `${_scanEidCol} as _eid`];
+          if (_scanTsCol) _scanSelParts.push(`${_scanTsCol} as _ts`);
+          const _scanWhere = [`${_scanEidCol} IN (${_scanTargetEids.map(() => "?").join(",")})`];
+          const _scanParams = [..._scanTargetEids];
+          if (_scanChanCol) {
+            _scanWhere.push(`(LOWER(${_scanChanCol}) LIKE '%security%' OR LOWER(${_scanChanCol}) LIKE '%sysmon%' OR LOWER(${_scanChanCol}) LIKE '%system%')`);
+          }
+          const _scanSql = `SELECT ${_scanSelParts.join(", ")} FROM data WHERE ${_scanWhere.join(" AND ")}${_scanTsCol ? ` ORDER BY ${_scanTsCol} ASC` : ""} LIMIT 50000`;
+          const _scanRows = db.prepare(_scanSql).all(..._scanParams);
+
+          // Accumulators for both detectors
+          const _impHits = [];
+          const _rmmDetected = new Map();
+
+          for (const row of _scanRows) {
+            const text = (row._alltext || "").toLowerCase();
+            const eid = String(row._eid || "");
+            const ts = row._ts || "";
+
+            // --- Impacket pattern matching (checked first, more specific) ---
+            let isImpacket = false;
+            // 1. Generic Impacket: cmd.exe /Q /c ... \\127.0.0.1\ADMIN$
+            if (text.includes("/q /c") && text.includes("\\\\127.0.0.1\\") && text.includes("admin$")) {
+              let v = "Impacket";
+              if (text.includes("__output")) v = "smbexec.py";
+              else if (text.includes("wmiprvse")) v = "wmiexec.py";
+              else if (text.includes("mmc.exe") || text.includes("-embedding")) v = "dcomexec.py";
+              else if (text.includes("admin$\\__")) v = "wmiexec.py";
+              _impHits.push({ v, ts, eid, d: "cmd.exe /Q /c with ADMIN$ output redirect" }); isImpacket = true;
+            }
+            // 2. smbexec __output pattern
+            if (!isImpacket && text.includes("__output") && (text.includes("2^>^&1") || text.includes("2>&1"))) {
+              _impHits.push({ v: "smbexec.py", ts, eid, d: "__output redirect pattern" }); isImpacket = true;
+            }
+            // 3. smbexec COMSPEC + triple .bat
+            if (!isImpacket && text.includes("%comspec%") && (text.match(/\.bat/g) || []).length >= 3) {
+              _impHits.push({ v: "smbexec.py", ts, eid, d: "%COMSPEC% batch execution chain" }); isImpacket = true;
+            }
+            // 4. wmiexec: wmiprvse.exe spawning cmd.exe /Q
+            if (!isImpacket && text.includes("wmiprvse.exe") && text.includes("cmd.exe") && text.includes("/q")) {
+              _impHits.push({ v: "wmiexec.py", ts, eid, d: "wmiprvse.exe spawning cmd.exe /Q" }); isImpacket = true;
+            }
+            // 5. dcomexec: mmc.exe -Embedding
+            if (!isImpacket && text.includes("mmc.exe") && text.includes("-embedding")) {
+              _impHits.push({ v: "dcomexec.py", ts, eid, d: "MMC DCOM execution (-Embedding)" }); isImpacket = true;
+            }
+            // 6. atexec: output to Windows\Temp\*.tmp + redirect
+            if (!isImpacket && text.includes("\\temp\\") && /\\[a-z]{8}\.tmp/i.test(text) && text.includes("2>&1")) {
+              _impHits.push({ v: "atexec.py", ts, eid, d: "Temp .tmp output file with redirect" }); isImpacket = true;
+            }
+            // 7. atexec: hardcoded StartBoundary (line 128 of atexec.py)
+            if (!isImpacket && text.includes("2015-07-15t20:35:13")) {
+              _impHits.push({ v: "atexec.py", ts, eid, d: "Hardcoded StartBoundary 2015-07-15T20:35:13" }); isImpacket = true;
+            }
+            // 8. psexec: RemCom named pipes
+            if (!isImpacket && (text.includes("remcom_communicat") || text.includes("remcom_stdin") || text.includes("remcom_stdout") || text.includes("remcom_stderr"))) {
+              _impHits.push({ v: "psexec.py", ts, eid, d: "RemCom named pipe" }); isImpacket = true;
+            }
+            // 9. smbexec: BTOBTO service name (legacy default)
+            if (!isImpacket && (eid === "7045" || eid === "4697") && text.includes("btobto")) {
+              _impHits.push({ v: "smbexec.py", ts, eid, d: 'Service name "BTOBTO"' }); isImpacket = true;
+            }
+            // 10. Event 7045/4697: service binary using cmd interpreter
+            if (!isImpacket && (eid === "7045" || eid === "4697")) {
+              const hasCmdBin = text.includes("cmd /c") || text.includes("cmd.exe /c") || text.includes("%comspec%") || (text.includes("powershell") && text.includes("-e"));
+              if (hasCmdBin) {
+                _impHits.push({ v: "smbexec.py/psexec.py", ts, eid, d: "Service binary using command interpreter" }); isImpacket = true;
+              }
+              // Random service name: 4 alpha (psexec) or 8 alpha (smbexec)
+              if (!isImpacket) {
+                const snMatch = text.match(/\bname[:\s]+([a-z]{4})\b/i) || text.match(/\bname[:\s]+([a-z]{8})\b/i);
+                if (snMatch && !COMMON_SVC.has(snMatch[1].toLowerCase())) {
+                  _impHits.push({ v: snMatch[1].length === 4 ? "psexec.py" : "smbexec.py", ts, eid, d: `Random ${snMatch[1].length}-char service name: ${snMatch[1]}` }); isImpacket = true;
+                }
+              }
+            }
+
+            // --- RMM keyword matching (runs regardless of Impacket match) ---
+            for (const kw of _rmmFlatKw) {
+              if (!text.includes(kw)) continue;
+              const tool = _rmmKwToTool.get(kw);
+              if (!_rmmDetected.has(tool.name)) {
+                _rmmDetected.set(tool.name, { firstTs: ts, lastTs: ts, count: 0, eventIds: new Set() });
+              }
+              const det = _rmmDetected.get(tool.name);
+              det.count++;
+              if (ts) { if (!det.firstTs || ts < det.firstTs) det.firstTs = ts; if (!det.lastTs || ts > det.lastTs) det.lastTs = ts; }
+              if (eid) det.eventIds.add(eid);
+              break; // one RMM tool match per row
+            }
+          }
+
+          // Emit Impacket findings grouped by variant
+          if (_impHits.length > 0) {
+            const _byVariant = new Map();
+            for (const h of _impHits) {
+              if (!_byVariant.has(h.v)) _byVariant.set(h.v, { count: 0, firstTs: h.ts, lastTs: h.ts, details: new Set(), eids: new Set() });
+              const g = _byVariant.get(h.v);
+              g.count++;
+              if (h.ts) { if (!g.firstTs || h.ts < g.firstTs) g.firstTs = h.ts; if (!g.lastTs || h.ts > g.lastTs) g.lastTs = h.ts; }
+              g.details.add(h.d); g.eids.add(h.eid);
+            }
+            for (const [variant, g] of _byVariant) {
+              findings.push({ id: fid++, severity: "critical", category: "Impacket Execution", mitre: "T1569.002", title: `Impacket ${variant} detected`, description: `${g.count} event(s) matching ${variant}: ${[...g.details].join("; ")}`, source: "", target: "", timeRange: { from: g.firstTs, to: g.lastTs }, eventCount: g.count, filterEids: [...g.eids] });
+            }
+          }
+          // Emit RMM findings
+          for (const [name, det] of _rmmDetected) {
+            const eids = [...det.eventIds].sort();
+            findings.push({ id: fid++, severity: "high", category: "RMM Tool", mitre: "T1219", title: `RMM tool detected: ${name}`, description: `${name} found in ${det.count} event(s)${eids.length > 0 ? ` (Event IDs: ${eids.join(", ")})` : ""}. Commonly abused for unauthorized remote access.`, source: "", target: "", timeRange: { from: det.firstTs, to: det.lastTs }, eventCount: det.count, filterEids: eids.length > 0 ? eids : null });
+          }
+        } catch (_scanErr) { /* silently skip Impacket/RMM detection on error */ }
+      }
+
+      // Lateral Pivot (T1021): middle hosts in chains
+      const pivotHosts = new Set();
+      for (const chain of chains) {
+        for (let i = 1; i < chain.path.length - 1; i++) {
+          const host = chain.path[i];
+          if (pivotHosts.has(host)) continue;
+          pivotHosts.add(host);
+          findings.push({ id: fid++, severity: "high", category: "Lateral Pivot", mitre: "T1021", title: `Pivot host: ${host}`, description: `Used as pivot in ${chain.hops}-hop chain: ${chain.path.join(" \u2192 ")}`, source: chain.path[i - 1], target: chain.path[i + 1], timeRange: { from: chain.timestamps[i] || "", to: chain.timestamps[i + 1] || "" }, eventCount: chain.hops });
+        }
+      }
+
+      // First Seen (T1021)
+      for (const edge of edgeMap.values()) {
+        if (!edge.isFirstSeen) continue;
+        findings.push({ id: fid++, severity: "low", category: "First Seen", mitre: "T1021", title: `New connection: ${edge.source} \u2192 ${edge.target}`, description: `First observed connection at ${(edge.firstSeen || "").slice(0, 19)}`, source: edge.source, target: edge.target, timeRange: { from: edge.firstSeen, to: edge.firstSeen }, eventCount: 1 });
+      }
+
+      const sevOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+      findings.sort((a, b) => (sevOrder[a.severity] ?? 4) - (sevOrder[b.severity] ?? 4));
+
       // Outlier host detection — flag default/generic/suspicious hostnames
       const OUTLIER_PATS = [
         [/^DESKTOP-[A-Z0-9]{5,}$/, "Default Windows hostname"],
@@ -3137,6 +3461,8 @@ class TimelineDB {
         })),
         chains,
         rdpSessions,
+        groupedSessions,
+        findings,
         stats: {
           totalEvents: timeOrdered.length, uniqueHosts: hostSet.size,
           uniqueUsers: new Set(timeOrdered.map((e) => e.user).filter(Boolean)).size,
@@ -3146,11 +3472,13 @@ class TimelineDB {
           chainCount: chains.length,
           rdpSessionCount: rdpSessions.length,
           adminSessions: rdpSessions.filter((s) => s.hasAdmin).length,
+          findingsCount: findings.length,
+          criticalFindings: findings.filter((f) => f.severity === "critical").length,
         },
         columns, error: null,
       };
     } catch (e) {
-      return { nodes: [], edges: [], chains: [], stats: {}, columns, error: e.message };
+      return { nodes: [], edges: [], chains: [], findings: [], groupedSessions: [], stats: {}, columns, error: e.message };
     }
   }
 
@@ -3941,6 +4269,7 @@ class TimelineDB {
    * Close all databases
    */
   closeAll() {
+    if (this._walInterval) { clearInterval(this._walInterval); this._walInterval = null; }
     for (const tabId of this.databases.keys()) {
       this.closeTab(tabId);
     }

@@ -5,6 +5,9 @@ contextBridge.exposeInMainWorld("tle", {
   openFileDialog: () => ipcRenderer.invoke("open-file-dialog"),
   importFiles: (filePaths) => ipcRenderer.invoke("import-files", { filePaths }),
   getPathForFile: (file) => webUtils.getPathForFile(file),
+  getRecentFiles: () => ipcRenderer.invoke("get-recent-files"),
+  openRecentFile: (filePath) => ipcRenderer.invoke("open-recent-file", { filePath }),
+  clearRecentFiles: () => ipcRenderer.invoke("clear-recent-files"),
 
   // Data queries (SQLite-backed)
   queryRows: (tabId, options) => ipcRenderer.invoke("query-rows", { tabId, options }),
@@ -18,6 +21,7 @@ contextBridge.exposeInMainWorld("tle", {
   getTabInfo: (tabId) => ipcRenderer.invoke("get-tab-info", { tabId }),
   getFtsStatus: (tabId) => ipcRenderer.invoke("get-fts-status", { tabId }),
   exportFiltered: (tabId, options) => ipcRenderer.invoke("export-filtered", { tabId, options }),
+  saveTextFile: (content, defaultPath, filters) => ipcRenderer.invoke("save-text-file", { content, defaultPath, filters }),
   generateReport: (tabId, fileName, tagColors) => ipcRenderer.invoke("generate-report", { tabId, fileName, tagColors }),
   selectSheet: (data) => ipcRenderer.invoke("select-sheet", data),
   searchCount: (tabId, searchTerm, searchMode, searchCondition) => ipcRenderer.invoke("search-count", { tabId, searchTerm, searchMode, searchCondition }),
@@ -66,6 +70,7 @@ contextBridge.exposeInMainWorld("tle", {
   onFtsProgress: (cb) => ipcRenderer.on("fts-progress", (_, d) => cb(d)),
   onIndexProgress: (cb) => ipcRenderer.on("index-progress", (_, d) => cb(d)),
   onSheetSelection: (cb) => ipcRenderer.on("sheet-selection", (_, d) => cb(d)),
+  onRecentFilesUpdated: (cb) => ipcRenderer.on("recent-files-updated", (_, d) => cb(d)),
 
   // Menu triggers
   onTriggerOpen: (cb) => ipcRenderer.on("trigger-open", () => cb()),

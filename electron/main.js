@@ -9,12 +9,37 @@
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const fsp = require("fs/promises");
 const TimelineDB = require("./db");
 const { parseFile, getXLSXSheets } = require("./parser");
 
 let mainWindow;
 const db = new TimelineDB();
 let tabCounter = 0;
+
+// ── Recent files persistence ──────────────────────────────────────
+const RECENT_FILES_MAX = 10;
+const _recentFilesPath = path.join(app.getPath("userData"), "recent-files.json");
+
+function _loadRecentFiles() {
+  try {
+    if (fs.existsSync(_recentFilesPath)) return JSON.parse(fs.readFileSync(_recentFilesPath, "utf8")).slice(0, RECENT_FILES_MAX);
+  } catch {}
+  return [];
+}
+
+function _saveRecentFiles(files) {
+  try { fs.writeFileSync(_recentFilesPath, JSON.stringify(files), "utf8"); } catch {}
+}
+
+function addRecentFile(filePath) {
+  const files = _loadRecentFiles().filter((f) => f !== filePath);
+  files.unshift(filePath);
+  if (files.length > RECENT_FILES_MAX) files.length = RECENT_FILES_MAX;
+  _saveRecentFiles(files);
+  _rebuildMenu();
+  safeSend("recent-files-updated", files);
+}
 
 // ── Debug trace logger (writes to stderr + file) ────────────────
 const debugLogPath = path.join(require("os").homedir(), "tle-debug.log");
@@ -66,9 +91,11 @@ function safeHandle(channel, handler) {
 }
 
 function safeSend(channel, data) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send(channel, data);
-  }
+  try {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+      mainWindow.webContents.send(channel, data);
+    }
+  } catch (e) { /* window closed mid-send */ }
 }
 
 // ── Import queue — serialize file imports to prevent concurrent memory exhaustion ──
@@ -80,6 +107,7 @@ function enqueueImport(filePath) {
   let fileName; try { fileName = decodeURIComponent(path.basename(filePath)); } catch { fileName = path.basename(filePath); }
   let fileSize = 0; try { fileSize = fs.statSync(filePath).size; } catch {}
   _importQueue.push({ filePath, fileName, fileSize });
+  addRecentFile(filePath);
   _broadcastQueue();
   _processQueue();
 }
@@ -346,6 +374,27 @@ safeHandle("open-file-dialog", async () => {
   });
   if (result.canceled) return null;
   for (const fp of result.filePaths) enqueueImport(fp);
+  return true;
+});
+
+// Recent files
+safeHandle("get-recent-files", () => _loadRecentFiles());
+
+safeHandle("open-recent-file", (event, { filePath }) => {
+  if (fs.existsSync(filePath)) {
+    enqueueImport(filePath);
+    return true;
+  }
+  // Remove stale entry
+  const files = _loadRecentFiles().filter((f) => f !== filePath);
+  _saveRecentFiles(files);
+  _rebuildMenu();
+  return { error: "File not found" };
+});
+
+safeHandle("clear-recent-files", () => {
+  _saveRecentFiles([]);
+  _rebuildMenu();
   return true;
 });
 
@@ -617,8 +666,20 @@ safeHandle("export-filtered", async (event, { tabId, options }) => {
     }
   }
 
-  writeStream.end();
+  await new Promise((resolve, reject) => {
+    writeStream.on("error", reject);
+    writeStream.on("finish", resolve);
+    writeStream.end();
+  });
   return { count, filePath: result.filePath };
+});
+
+// Save text content to file with save dialog
+safeHandle("save-text-file", async (event, { content, defaultPath, filters }) => {
+  const result = await dialog.showSaveDialog(mainWindow, { defaultPath, filters });
+  if (result.canceled) return null;
+  await fsp.writeFile(result.filePath, content, "utf-8");
+  return { filePath: result.filePath };
 });
 
 // Generate HTML report from bookmarked/tagged events
@@ -633,7 +694,7 @@ safeHandle("generate-report", async (event, { tabId, fileName, tagColors }) => {
   if (result.canceled) return null;
 
   const html = buildReportHtml(reportData, fileName, tagColors);
-  fs.writeFileSync(result.filePath, html, "utf-8");
+  await fsp.writeFile(result.filePath, html, "utf-8");
   return { filePath: result.filePath };
 });
 
@@ -762,7 +823,7 @@ safeHandle("save-session", async (event, { sessionData }) => {
     filters: [{ name: "TLE Session", extensions: ["tle"] }],
   });
   if (result.canceled) return null;
-  fs.writeFileSync(result.filePath, JSON.stringify(sessionData, null, 2), "utf-8");
+  await fsp.writeFile(result.filePath, JSON.stringify(sessionData, null, 2), "utf-8");
   return result.filePath;
 });
 
@@ -804,13 +865,29 @@ safeHandle("load-filter-presets", () => {
   catch { return []; }
 });
 
-safeHandle("save-filter-presets", (event, { presets }) => {
-  fs.writeFileSync(presetsPath, JSON.stringify(presets, null, 2));
+safeHandle("save-filter-presets", async (event, { presets }) => {
+  await fsp.writeFile(presetsPath, JSON.stringify(presets, null, 2));
   return true;
 });
 
 // ── Native macOS Menu ──────────────────────────────────────────────
+function _rebuildMenu() { buildMenu(); }
+
 function buildMenu() {
+  // Build recent files submenu
+  const recentFiles = _loadRecentFiles();
+  const recentSubmenu = recentFiles.length > 0
+    ? [
+        ...recentFiles.map((fp) => ({
+          label: path.basename(fp),
+          toolTip: fp,
+          click: () => { if (fs.existsSync(fp)) enqueueImport(fp); },
+        })),
+        { type: "separator" },
+        { label: "Clear Recent", click: () => { _saveRecentFiles([]); _rebuildMenu(); } },
+      ]
+    : [{ label: "No Recent Files", enabled: false }];
+
   const template = [
     {
       label: "IRFlow Timeline",
@@ -833,6 +910,10 @@ function buildMenu() {
           label: "Open...",
           accelerator: "CmdOrCtrl+O",
           click: () => mainWindow?.webContents.send("trigger-open"),
+        },
+        {
+          label: "Open Recent",
+          submenu: recentSubmenu,
         },
         { type: "separator" },
         {
